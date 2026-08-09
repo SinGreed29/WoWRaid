@@ -1,0 +1,4 @@
+.env
+raids.sqlite3
+__pycache__/
+*.pyc
