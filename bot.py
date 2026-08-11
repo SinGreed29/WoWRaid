@@ -490,6 +490,9 @@ class DB:
                         "UPDATE players SET group_no=? WHERE channel_id=? AND discord_id=?",
                         (idx // 6 + 1, channel_id, row[0]),
                     )
+        raid_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(raids)").fetchall()}
+        if "leader_name" not in raid_columns:
+            self.conn.execute("ALTER TABLE raids ADD COLUMN leader_name TEXT")
         self.conn.commit()
 
     def create_raid(self, data: dict):
@@ -502,6 +505,10 @@ class DB:
             data["raid_id"], data["difficulty_name"], data["difficulty_id"],
             data["leader_id"], data.get("leader_name"), None, int(time.time())
         ))
+        self.conn.commit()
+
+    def set_leader_name(self, channel_id: int, leader_name: str):
+        self.conn.execute("UPDATE raids SET leader_name=? WHERE channel_id=?", (leader_name, channel_id))
         self.conn.commit()
 
     def set_message(self, channel_id: int, message_id: int):
@@ -967,6 +974,24 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
     else:
         embed.add_field(name="Опыт рейда", value="Пока нет данных Warcraft Logs по боссам.", inline=False)
 
+    # Leader is shown BEFORE the approved roster. Prefer the stored Discord display name.
+    leader_name = raid["leader_name"] if "leader_name" in raid.keys() else None
+    if not leader_name and guild and raid["leader_id"]:
+        leader_member = guild.get_member(int(raid["leader_id"]))
+        if leader_member:
+            leader_name = leader_member.display_name
+            try:
+                db.set_leader_name(raid["channel_id"], leader_name)
+            except Exception:
+                pass
+    leader_name = leader_name or "Неизвестно"
+
+    embed.add_field(
+        name="Рейд лидер",
+        value=f"**{leader_name}**",
+        inline=False,
+    )
+
     embed.add_field(
         name=f"Утвержденный состав ({len(confirmed)}/{RAID_LIMIT})",
         value=(
@@ -976,9 +1001,6 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
         ),
         inline=False,
     )
-    leader_member = guild.get_member(int(raid["leader_id"])) if guild and raid["leader_id"] else None
-    leader_name = leader_member.display_name if leader_member else str(raid["leader_id"])
-    embed.add_field(name="Рейд лидер", value=f"**{leader_name}**", inline=False)
 
 
     # Six groups, five players each. Force two groups per row with a blank inline field.
