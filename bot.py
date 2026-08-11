@@ -976,11 +976,14 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
 
     # Leader is shown BEFORE the approved roster. Prefer the stored Discord display name.
     leader_name = raid["leader_name"] if "leader_name" in raid.keys() else None
-    if (not leader_name or leader_name == "Неизвестно") and guild and raid["leader_id"]:
-        leader_member = guild.get_member(int(raid["leader_id"]))
+    leader_id = int(raid["leader_id"]) if raid["leader_id"] else None
+
+    # Resolve and cache the leader name, but display the actual Discord mention.
+    if not leader_name and guild and leader_id:
+        leader_member = guild.get_member(leader_id)
         if leader_member is None:
             try:
-                leader_member = await guild.fetch_member(int(raid["leader_id"]))
+                leader_member = await guild.fetch_member(leader_id)
             except (discord.NotFound, discord.HTTPException, discord.Forbidden):
                 leader_member = None
         if leader_member:
@@ -989,12 +992,13 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
                 db.set_leader_name(raid["channel_id"], leader_name)
             except Exception:
                 pass
-    if not leader_name:
-        leader_name = f"<@{int(raid['leader_id'])}>" if raid["leader_id"] else "Неизвестно"
+
+    # <@ID> is a real clickable Discord mention, not plain text.
+    leader_mention = f"<@{leader_id}>" if leader_id else (leader_name or "Неизвестно")
 
     embed.add_field(
         name="Рейд лидер",
-        value=f"**{leader_name}**",
+        value=leader_mention,
         inline=False,
     )
 
