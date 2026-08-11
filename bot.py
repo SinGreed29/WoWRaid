@@ -249,7 +249,9 @@ CLASS_EMOJI_NAMES = {
 
 # Spec emojis are keyed by WCL spec name, so duplicate Russian names such as
 # "Свет" (Paladin/Priest) and "Защита" (Warrior/Paladin) resolve identically.
+
 SPEC_EMOJI_NAMES = {
+    "Маг: Лёд": "mage_frost",
     "Arms": "spec_arms",
     "Fury": "spec_fury",
     "Protection": "spec_protection",
@@ -412,6 +414,15 @@ def parse_emoji(p: Optional[float]) -> str:
     if p >= 25:
         return "🟩"
     return "⬜"
+
+
+def get_custom_emoji_by_name(guild: Optional[discord.Guild], name: str, fallback: str = "") -> str:
+    """Return a server custom emoji by name, falling back safely when unavailable."""
+    if guild:
+        emoji = discord.utils.get(guild.emojis, name=name)
+        if emoji:
+            return str(emoji)
+    return fallback
 
 class DB:
     def __init__(self, path: str):
