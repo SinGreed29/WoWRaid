@@ -569,6 +569,29 @@ class DB:
             (channel_id, group_no),
         ).fetchall()
 
+    def rebalance_groups_if_needed(self, channel_id: int):
+        """Migrate the old 5x6 layout to 6x5 once, without touching later manual grouping."""
+        rows = self.get_players(channel_id)
+        confirmed = [r for r in rows if r["status"] == "confirmed"]
+        if not confirmed:
+            return
+        counts = {i: 0 for i in range(1, 7)}
+        for row in confirmed:
+            g = int(row["group_no"] or 1)
+            if g in counts:
+                counts[g] += 1
+        # Detect the old layout: group 6 unused and at least one of groups 1-5 over capacity.
+        if counts[6] != 0 or max(counts[i] for i in range(1, 6)) <= 5:
+            return
+        now = int(time.time())
+        for pos, row in enumerate(confirmed):
+            group_no = (pos // 5) + 1
+            self.conn.execute(
+                "UPDATE players SET group_no=?, updated_at=? WHERE channel_id=? AND discord_id=?",
+                (group_no, now, channel_id, row["discord_id"]),
+            )
+        self.conn.commit()
+
     def set_status(self, channel_id: int, discord_id: int, status: str):
         self.conn.execute(
             "UPDATE players SET status=?, updated_at=? WHERE channel_id=? AND discord_id=?",
@@ -873,6 +896,11 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
     """Build a compact public raid card close to the requested reference layout."""
     info = RAIDS[raid["raid_id"]]
     guild = bot.get_guild(int(raid["guild_id"])) if raid["guild_id"] else None
+    try:
+        db.rebalance_groups_if_needed(raid["channel_id"])
+        players = [make_player_dict(r) for r in db.get_players(raid["channel_id"])]
+    except Exception as e:
+        print(f"[group migration] {e}")
     confirmed = [p for p in players if p.get("status") == "confirmed"]
 
     avg_values = [percentile_number(p.get("avg_parse")) for p in confirmed]
@@ -934,9 +962,9 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
         inline=False,
     )
 
-    # Five persistent groups. Each group is full-width so character names have
-    # enough room and the leader can manually move players between groups.
-    for group_no in range(1, 6):
+    # Six groups, five players each. Force two groups per row with a blank inline field.
+    group_fields = {}
+    for group_no in range(1, 7):
         group = [p for p in confirmed if int(p.get("group_no") or 1) == group_no]
         lines = []
         for p in group:
@@ -947,11 +975,16 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
             if p.get("profile_url"):
                 name = f"[{name}]({p['profile_url']})"
             lines.append(f"{icons} **{parse_text}** {name}")
-        embed.add_field(
-            name=f"Группа {group_no} · {len(group)}/6",
-            value="\n".join(lines) or "—",
-            inline=False,
-        )
+        group_fields[group_no] = (f"Группа {group_no} · {len(group)}/5", "\n".join(lines) or "—")
+
+    for left in (1, 3, 5):
+        right = left + 1
+        left_name, left_value = group_fields[left]
+        right_name, right_value = group_fields[right]
+        embed.add_field(name=left_name, value=left_value, inline=True)
+        embed.add_field(name=right_name, value=right_value, inline=True)
+        # Discord lays inline fields in rows of three; this spacer forces the next pair to a new row.
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
 
     # Show the remaining capacity without a wall of empty "Группа" fields.
     free_slots = max(0, RAID_LIMIT - len(confirmed))
@@ -1130,8 +1163,8 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
 
         group_no = int(old["group_no"] or 1) if old else 1
         if not old:
-            for candidate in range(1, 6):
-                if len(db.get_group_players(self.channel_id, candidate)) < 6:
+            for candidate in range(1, 7):
+                if len(db.get_group_players(self.channel_id, candidate)) < 5:
                     group_no = candidate
                     break
 
@@ -1302,7 +1335,7 @@ class CancelButton(discord.ui.Button):
 class GroupSourceSelect(discord.ui.Select):
     def __init__(self, channel_id: int):
         self.channel_id = channel_id
-        options = [discord.SelectOption(label=f"Группа {i}", value=str(i), emoji="👥") for i in range(1, 6)]
+        options = [discord.SelectOption(label=f"Группа {i}", value=str(i), emoji="👥") for i in range(1, 7)]
         super().__init__(placeholder="Выберите группу игрока", options=options, custom_id="raid_group_source")
 
     async def callback(self, interaction: discord.Interaction):
@@ -1354,7 +1387,7 @@ class GroupDestinationSelect(discord.ui.Select):
         self.source_group = source_group
         options = [
             discord.SelectOption(label=f"Группа {i}", value=str(i), emoji="👥", default=(i == source_group))
-            for i in range(1, 6)
+            for i in range(1, 7)
         ]
         super().__init__(placeholder="Выберите новую группу", options=options, custom_id=f"raid_group_dest_{player_id}")
 
@@ -1364,9 +1397,9 @@ class GroupDestinationSelect(discord.ui.Select):
         if not player:
             await interaction.response.edit_message(content="❌ Игрок уже не найден.", view=GroupSourceView(self.channel_id))
             return
-        if destination != self.source_group and len(db.get_group_players(self.channel_id, destination)) >= 6:
+        if destination != self.source_group and len(db.get_group_players(self.channel_id, destination)) >= 5:
             await interaction.response.edit_message(
-                content=f"❌ Группа {destination} уже заполнена (6/6). Выберите другую:",
+                content=f"❌ Группа {destination} уже заполнена (5/5). Выберите другую:",
                 view=GroupDestinationView(self.channel_id, self.player_id, self.source_group),
             )
             return
