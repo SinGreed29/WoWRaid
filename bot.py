@@ -446,6 +446,7 @@ class DB:
             difficulty_name TEXT NOT NULL,
             difficulty_id INTEGER NOT NULL,
             leader_id INTEGER NOT NULL,
+            leader_name TEXT,
             message_id INTEGER,
             closed INTEGER NOT NULL DEFAULT 0,
             raid_log TEXT,
@@ -494,12 +495,12 @@ class DB:
     def create_raid(self, data: dict):
         self.conn.execute("""
         INSERT INTO raids
-        (channel_id,guild_id,name,date_text,raid_id,difficulty_name,difficulty_id,leader_id,message_id,created_at)
+        (channel_id,guild_id,name,date_text,raid_id,difficulty_name,difficulty_id,leader_id,leader_name,message_id,created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)
         """, (
             data["channel_id"], data["guild_id"], data["name"], data["date_text"],
             data["raid_id"], data["difficulty_name"], data["difficulty_id"],
-            data["leader_id"], None, int(time.time())
+            data["leader_id"], data.get("leader_name"), None, int(time.time())
         ))
         self.conn.commit()
 
@@ -1079,6 +1080,7 @@ class RaidSetupModal(discord.ui.Modal, title="Настройка рейда"):
             "difficulty_name": self.difficulty_name,
             "difficulty_id": diff_id,
             "leader_id": interaction.user.id,
+            "leader_name": interaction.user.display_name,
         })
         await interaction.response.send_message(
             content="@here",
