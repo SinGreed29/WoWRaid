@@ -251,7 +251,6 @@ CLASS_EMOJI_NAMES = {
 # "Свет" (Paladin/Priest) and "Защита" (Warrior/Paladin) resolve identically.
 
 SPEC_EMOJI_NAMES = {
-    "Маг: Лёд": "mage_frost",
     "Arms": "spec_arms",
     "Fury": "spec_fury",
     "Protection": "spec_protection",
@@ -304,7 +303,10 @@ def player_icons(guild: Optional[discord.Guild], player: dict) -> str:
     """Class + specialization icons only. Role icons are intentionally omitted next to names."""
     cd = CLASS_SPECS.get(player.get("class_name"), {})
     class_name = CLASS_EMOJI_NAMES.get(player.get("wcl_class") or cd.get("wcl"))
-    spec_name = SPEC_EMOJI_NAMES.get(player.get("wcl_spec"))
+    if player.get("class_name") == "Маг" and player.get("wcl_spec") == "Frost":
+        spec_name = "mage_frost"
+    else:
+        spec_name = SPEC_EMOJI_NAMES.get(player.get("wcl_spec"))
     class_icon = get_custom_emoji(guild, class_name) if class_name else ""
     spec_icon = get_custom_emoji(guild, spec_name) if spec_name else ""
     if not class_icon:
@@ -314,7 +316,8 @@ def player_icons(guild: Optional[discord.Guild], player: dict) -> str:
 def select_emoji(guild: Optional[discord.Guild], class_name: str, wcl_spec: Optional[str] = None):
     """Custom emoji for dropdowns, with a safe Unicode fallback."""
     if wcl_spec:
-        emoji = get_custom_emoji_obj(guild, SPEC_EMOJI_NAMES.get(wcl_spec))
+        emoji_name = "mage_frost" if class_name == "Маг" and wcl_spec == "Frost" else SPEC_EMOJI_NAMES.get(wcl_spec)
+        emoji = get_custom_emoji_obj(guild, emoji_name)
         if emoji:
             return emoji
     cd = CLASS_SPECS[class_name]
@@ -972,6 +975,10 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
         ),
         inline=False,
     )
+    leader_member = guild.get_member(int(raid["leader_id"])) if guild and raid["leader_id"] else None
+    leader_name = leader_member.display_name if leader_member else str(raid["leader_id"])
+    embed.add_field(name="Рейд лидер", value=f"**{leader_name}**", inline=False)
+
 
     # Six groups, five players each. Force two groups per row with a blank inline field.
     group_fields = {}
@@ -986,7 +993,7 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
             if p.get("profile_url"):
                 name = f"[{name}]({p['profile_url']})"
             lines.append(f"{icons} **{parse_text}** {name}")
-        group_fields[group_no] = (f"Группа {group_no} · {len(group)}/5", "\n".join(lines) or "—")
+        group_fields[group_no] = (f"Группа {group_no}", "\n".join(lines) or "—")
 
     for left in (1, 3, 5):
         right = left + 1
