@@ -914,7 +914,7 @@ def make_player_dict(row: sqlite3.Row) -> dict:
         d["bosses"] = []
     return d
 
-def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
+async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
     """Build a compact public raid card close to the requested reference layout."""
     info = RAIDS[raid["raid_id"]]
     guild = bot.get_guild(int(raid["guild_id"])) if raid["guild_id"] else None
@@ -976,15 +976,21 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
 
     # Leader is shown BEFORE the approved roster. Prefer the stored Discord display name.
     leader_name = raid["leader_name"] if "leader_name" in raid.keys() else None
-    if not leader_name and guild and raid["leader_id"]:
+    if (not leader_name or leader_name == "Неизвестно") and guild and raid["leader_id"]:
         leader_member = guild.get_member(int(raid["leader_id"]))
+        if leader_member is None:
+            try:
+                leader_member = await guild.fetch_member(int(raid["leader_id"]))
+            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                leader_member = None
         if leader_member:
             leader_name = leader_member.display_name
             try:
                 db.set_leader_name(raid["channel_id"], leader_name)
             except Exception:
                 pass
-    leader_name = leader_name or "Неизвестно"
+    if not leader_name:
+        leader_name = f"<@{int(raid['leader_id'])}>" if raid["leader_id"] else "Неизвестно"
 
     embed.add_field(
         name="Рейд лидер",
@@ -1075,7 +1081,7 @@ async def refresh_raid_message(channel: discord.abc.Messageable, channel_id: int
     except Exception:
         return
     await msg.edit(
-        embed=build_raid_embed(raid, players),
+        embed=await build_raid_embed(raid, players),
         view=raid_view_with_log(raid["raid_log"]),
     )
 
@@ -1106,7 +1112,7 @@ class RaidSetupModal(discord.ui.Modal, title="Настройка рейда"):
         })
         await interaction.response.send_message(
             content="@here",
-            embed=build_raid_embed(db.get_raid(interaction.channel_id), []),
+            embed=await build_raid_embed(db.get_raid(interaction.channel_id), []),
             view=raid_view_with_log(),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
@@ -1573,7 +1579,7 @@ async def raid_close(interaction: discord.Interaction):
     players = [make_player_dict(r) for r in db.get_players(interaction.channel_id)]
     msg = await interaction.channel.fetch_message(raid["message_id"])
     await msg.edit(
-        embed=build_raid_embed(raid, players),
+        embed=await build_raid_embed(raid, players),
         view=None
     )
     await interaction.response.send_message("🔒 Набор закрыт.", ephemeral=True)
