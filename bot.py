@@ -17,17 +17,15 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Всегда ищем .env рядом с bot.py
+CODE_VERSION = "2026-08-20-full-raid-fix-v3"
+
+# Local development: if .env exists next to bot.py, load it.
+# On Railway/.other hosts secrets are provided as environment variables, so
+# .env is optional and must NOT be committed to GitHub.
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
-
-if not ENV_FILE.exists():
-    raise SystemExit(
-        f"Файл .env не найден!\n"
-        f"Ожидаемый путь:\n{ENV_FILE}"
-    )
-
-load_dotenv(dotenv_path=ENV_FILE, override=True)
+if ENV_FILE.exists():
+    load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 WCL_CLIENT_ID = os.getenv("WCL_CLIENT_ID", "").strip()
@@ -36,21 +34,23 @@ WCL_SITE = os.getenv("WCL_SITE", "https://www.warcraftlogs.com").rstrip("/")
 WCL_API = os.getenv("WCL_API", f"{WCL_SITE}/api/v2/client").rstrip("/")
 WCL_REGION = os.getenv("WCL_REGION", "eu").strip().lower()
 WCL_DEFAULT_REALM = os.getenv("WCL_DEFAULT_REALM", "howling-fjord").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "raids.sqlite3")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/raids.sqlite3")
 REFRESH_MINUTES = max(5, int(os.getenv("REFRESH_MINUTES", "15")))
-RAID_LIMIT = max(1, min(40, int(os.getenv("RAID_LIMIT", "25"))))
+RAID_LIMIT = 30  # 6 групп по 5 человек
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
 if not DISCORD_TOKEN:
-    raise SystemExit("DISCORD_TOKEN не задан. Создайте .env и укажите токен Discord.")
+    raise SystemExit("DISCORD_TOKEN не задан. Добавьте DISCORD_TOKEN в переменные окружения Railway или в локальный .env.")
 if not WCL_CLIENT_ID or not WCL_CLIENT_SECRET:
-    raise SystemExit("WCL_CLIENT_ID/WCL_CLIENT_SECRET не заданы. Создайте OAuth Client в Warcraft Logs.")
+    raise SystemExit("WCL_CLIENT_ID/WCL_CLIENT_SECRET не заданы. Добавьте их в переменные окружения Railway или в локальный .env.")
+print(f"[CONFIG] CODE_VERSION: {CODE_VERSION}")
 print(f"[CONFIG] bot.py: {Path(__file__).resolve()}")
-print(f"[CONFIG] .env:   {ENV_FILE}")
-print(f"[CONFIG] .env существует: {ENV_FILE.exists()}")
+print(f"[CONFIG] DATABASE_PATH: {DATABASE_PATH}")
+print(f"[CONFIG] .env найден: {ENV_FILE.exists()} (на Railway не требуется)")
 print(f"[CONFIG] Discord token: {'OK' if DISCORD_TOKEN else 'НЕ НАЙДЕН'}")
 print(f"[CONFIG] WCL Client ID: {'OK' if WCL_CLIENT_ID else 'НЕ НАЙДЕН'}")
 print(f"[CONFIG] WCL Secret: {'OK' if WCL_CLIENT_SECRET else 'НЕ НАЙДЕН'}")
+print(f"[CONFIG] RAID_LIMIT: {RAID_LIMIT}")
 
 # Midnight raid zones currently used by the bot.
 RAIDS = {
@@ -253,6 +253,7 @@ CLASS_EMOJI_NAMES = {
 
 # Spec emojis are keyed by WCL spec name, so duplicate Russian names such as
 # "Свет" (Paladin/Priest) and "Защита" (Warrior/Paladin) resolve identically.
+
 SPEC_EMOJI_NAMES = {
     "Arms": "spec_arms",
     "Fury": "spec_fury",
@@ -306,7 +307,10 @@ def player_icons(guild: Optional[discord.Guild], player: dict) -> str:
     """Class + specialization icons only. Role icons are intentionally omitted next to names."""
     cd = CLASS_SPECS.get(player.get("class_name"), {})
     class_name = CLASS_EMOJI_NAMES.get(player.get("wcl_class") or cd.get("wcl"))
-    spec_name = SPEC_EMOJI_NAMES.get(player.get("wcl_spec"))
+    if player.get("class_name") == "Маг" and player.get("wcl_spec") == "Frost":
+        spec_name = "mage_frost"
+    else:
+        spec_name = SPEC_EMOJI_NAMES.get(player.get("wcl_spec"))
     class_icon = get_custom_emoji(guild, class_name) if class_name else ""
     spec_icon = get_custom_emoji(guild, spec_name) if spec_name else ""
     if not class_icon:
@@ -316,7 +320,8 @@ def player_icons(guild: Optional[discord.Guild], player: dict) -> str:
 def select_emoji(guild: Optional[discord.Guild], class_name: str, wcl_spec: Optional[str] = None):
     """Custom emoji for dropdowns, with a safe Unicode fallback."""
     if wcl_spec:
-        emoji = get_custom_emoji_obj(guild, SPEC_EMOJI_NAMES.get(wcl_spec))
+        emoji_name = "mage_frost" if class_name == "Маг" and wcl_spec == "Frost" else SPEC_EMOJI_NAMES.get(wcl_spec)
+        emoji = get_custom_emoji_obj(guild, emoji_name)
         if emoji:
             return emoji
     cd = CLASS_SPECS[class_name]
@@ -417,6 +422,15 @@ def parse_emoji(p: Optional[float]) -> str:
         return "🟩"
     return "⬜"
 
+
+def get_custom_emoji_by_name(guild: Optional[discord.Guild], name: str, fallback: str = "") -> str:
+    """Return a server custom emoji by name, falling back safely when unavailable."""
+    if guild:
+        emoji = discord.utils.get(guild.emojis, name=name)
+        if emoji:
+            return str(emoji)
+    return fallback
+
 class DB:
     def __init__(self, path: str):
         self.path = path
@@ -436,6 +450,7 @@ class DB:
             difficulty_name TEXT NOT NULL,
             difficulty_id INTEGER NOT NULL,
             leader_id INTEGER NOT NULL,
+            leader_name TEXT,
             message_id INTEGER,
             closed INTEGER NOT NULL DEFAULT 0,
             raid_log TEXT,
@@ -459,22 +474,45 @@ class DB:
             bosses_json TEXT NOT NULL DEFAULT '[]',
             profile_url TEXT,
             updated_at INTEGER,
+            group_no INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY(channel_id, discord_id),
             FOREIGN KEY(channel_id) REFERENCES raids(channel_id) ON DELETE CASCADE
         );
         """)
+        # Safe migration for existing databases created before manual groups.
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(players)").fetchall()}
+        if "group_no" not in columns:
+            self.conn.execute("ALTER TABLE players ADD COLUMN group_no INTEGER NOT NULL DEFAULT 1")
+            for channel_id in [r[0] for r in self.conn.execute("SELECT DISTINCT channel_id FROM players").fetchall()]:
+                rows = self.conn.execute(
+                    "SELECT discord_id FROM players WHERE channel_id=? AND status='confirmed' "
+                    "ORDER BY updated_at ASC, discord_id ASC",
+                    (channel_id,),
+                ).fetchall()
+                for idx, row in enumerate(rows):
+                    self.conn.execute(
+                        "UPDATE players SET group_no=? WHERE channel_id=? AND discord_id=?",
+                        (idx // 6 + 1, channel_id, row[0]),
+                    )
+        raid_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(raids)").fetchall()}
+        if "leader_name" not in raid_columns:
+            self.conn.execute("ALTER TABLE raids ADD COLUMN leader_name TEXT")
         self.conn.commit()
 
     def create_raid(self, data: dict):
         self.conn.execute("""
         INSERT INTO raids
-        (channel_id,guild_id,name,date_text,raid_id,difficulty_name,difficulty_id,leader_id,message_id,created_at)
+        (channel_id,guild_id,name,date_text,raid_id,difficulty_name,difficulty_id,leader_id,leader_name,message_id,created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)
         """, (
             data["channel_id"], data["guild_id"], data["name"], data["date_text"],
             data["raid_id"], data["difficulty_name"], data["difficulty_id"],
-            data["leader_id"], None, int(time.time())
+            data["leader_id"], data.get("leader_name"), None, int(time.time())
         ))
+        self.conn.commit()
+
+    def set_leader_name(self, channel_id: int, leader_name: str):
+        self.conn.execute("UPDATE raids SET leader_name=? WHERE channel_id=?", (leader_name, channel_id))
         self.conn.commit()
 
     def set_message(self, channel_id: int, message_id: int):
@@ -515,8 +553,8 @@ class DB:
         self.conn.execute("""
         INSERT INTO players
         (channel_id,discord_id,discord_name,character_name,realm,region,class_name,wcl_class,
-         spec_name,wcl_spec,role,status,avg_parse,best_parse,bosses_json,profile_url,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         spec_name,wcl_spec,role,status,avg_parse,best_parse,bosses_json,profile_url,updated_at,group_no)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(channel_id,discord_id) DO UPDATE SET
           discord_name=excluded.discord_name,
           character_name=excluded.character_name,
@@ -539,8 +577,45 @@ class DB:
             data["class_name"], data["wcl_class"], data["spec_name"],
             data["wcl_spec"], data["role"], data["status"], data["avg_parse"],
             data["best_parse"], json.dumps(data.get("bosses", []), ensure_ascii=False),
-            data.get("profile_url"), int(time.time())
+            data.get("profile_url"), int(time.time()), data.get("group_no", 1)
         ))
+        self.conn.commit()
+
+    def set_group(self, channel_id: int, discord_id: int, group_no: int):
+        self.conn.execute(
+            "UPDATE players SET group_no=?, updated_at=? WHERE channel_id=? AND discord_id=?",
+            (group_no, int(time.time()), channel_id, discord_id),
+        )
+        self.conn.commit()
+
+    def get_group_players(self, channel_id: int, group_no: int):
+        return self.conn.execute(
+            "SELECT * FROM players WHERE channel_id=? AND group_no=? AND status='confirmed' "
+            "ORDER BY updated_at ASC, discord_id ASC",
+            (channel_id, group_no),
+        ).fetchall()
+
+    def rebalance_groups_if_needed(self, channel_id: int):
+        """Migrate the old 5x6 layout to 6x5 once, without touching later manual grouping."""
+        rows = self.get_players(channel_id)
+        confirmed = [r for r in rows if r["status"] == "confirmed"]
+        if not confirmed:
+            return
+        counts = {i: 0 for i in range(1, 7)}
+        for row in confirmed:
+            g = int(row["group_no"] or 1)
+            if g in counts:
+                counts[g] += 1
+        # Detect the old layout: group 6 unused and at least one of groups 1-5 over capacity.
+        if counts[6] != 0 or max(counts[i] for i in range(1, 6)) <= 5:
+            return
+        now = int(time.time())
+        for pos, row in enumerate(confirmed):
+            group_no = (pos // 5) + 1
+            self.conn.execute(
+                "UPDATE players SET group_no=?, updated_at=? WHERE channel_id=? AND discord_id=?",
+                (group_no, now, channel_id, row["discord_id"]),
+            )
         self.conn.commit()
 
     def set_status(self, channel_id: int, discord_id: int, status: str):
@@ -680,7 +755,7 @@ class WCLClient:
         bosses = []
         raw_rankings = rankings.get("rankings") or []
         for item in raw_rankings:
-            boss_name = item.get("encounter", item.get("boss", "Босс"))
+            boss_name = normalize_boss_name(item.get("encounter", item.get("boss", "Босс")))
             p = percentile_number(item.get("rankPercent", item.get("percentile", item.get("performance"))))
             bosses.append({
                 "boss": boss_name,
@@ -788,11 +863,33 @@ def extract_report_code(url: str) -> Optional[str]:
     m = re.search(r"/reports/([A-Za-z0-9]+)", url.strip())
     return m.group(1) if m else None
 
+Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
 db = DB(DATABASE_PATH)
 wcl = WCLClient()
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+def normalize_boss_name(value: Any) -> str:
+    """Return a clean boss name from WCL strings or encounter dictionaries.
+
+    WCL may return encounter as {"id": ..., "name": ...}; older bot versions
+    could also have stored that dict representation in SQLite.
+    """
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("boss") or "Босс").strip()
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{"):
+            try:
+                parsed = ast.literal_eval(text)
+                if isinstance(parsed, dict):
+                    return str(parsed.get("name") or parsed.get("boss") or "Босс").strip()
+            except (ValueError, SyntaxError):
+                pass
+        return text or "Босс"
+    return str(value or "Босс").strip()
+
 
 def make_player_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
@@ -811,15 +908,26 @@ def make_player_dict(row: sqlite3.Row) -> dict:
             pass
 
     try:
-        d["bosses"] = json.loads(d.get("bosses_json") or "[]")
+        raw_bosses = json.loads(d.get("bosses_json") or "[]")
+        d["bosses"] = []
+        for boss in raw_bosses if isinstance(raw_bosses, list) else []:
+            if isinstance(boss, dict):
+                boss_copy = dict(boss)
+                boss_copy["boss"] = normalize_boss_name(boss_copy.get("boss") or boss_copy.get("encounter"))
+                d["bosses"].append(boss_copy)
     except (json.JSONDecodeError, TypeError):
         d["bosses"] = []
     return d
 
-def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
+async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
     """Build a compact public raid card close to the requested reference layout."""
     info = RAIDS[raid["raid_id"]]
     guild = bot.get_guild(int(raid["guild_id"])) if raid["guild_id"] else None
+    try:
+        db.rebalance_groups_if_needed(raid["channel_id"])
+        players = [make_player_dict(r) for r in db.get_players(raid["channel_id"])]
+    except Exception as e:
+        print(f"[group migration] {e}")
     confirmed = [p for p in players if p.get("status") == "confirmed"]
 
     avg_values = [percentile_number(p.get("avg_parse")) for p in confirmed]
@@ -849,7 +957,7 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
     boss_order: list[str] = []
     for p in confirmed:
         for boss in p.get("bosses", []):
-            boss_name = str(boss.get("boss") or "Босс").strip()
+            boss_name = normalize_boss_name(boss.get("boss") or boss.get("encounter"))
             percentile = percentile_number(boss.get("percentile"))
             if boss_name not in boss_values:
                 boss_values[boss_name] = []
@@ -871,6 +979,34 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
     else:
         embed.add_field(name="Опыт рейда", value="Пока нет данных Warcraft Logs по боссам.", inline=False)
 
+    # Leader is shown BEFORE the approved roster. Prefer the stored Discord display name.
+    leader_name = raid["leader_name"] if "leader_name" in raid.keys() else None
+    leader_id = int(raid["leader_id"]) if raid["leader_id"] else None
+
+    # Resolve and cache the leader name, but display the actual Discord mention.
+    if not leader_name and guild and leader_id:
+        leader_member = guild.get_member(leader_id)
+        if leader_member is None:
+            try:
+                leader_member = await guild.fetch_member(leader_id)
+            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                leader_member = None
+        if leader_member:
+            leader_name = leader_member.display_name
+            try:
+                db.set_leader_name(raid["channel_id"], leader_name)
+            except Exception:
+                pass
+
+    # <@ID> is a real clickable Discord mention, not plain text.
+    leader_mention = f"<@{leader_id}>" if leader_id else (leader_name or "Неизвестно")
+
+    embed.add_field(
+        name="Рейд лидер",
+        value=leader_mention,
+        inline=False,
+    )
+
     embed.add_field(
         name=f"Утвержденный состав ({len(confirmed)}/{RAID_LIMIT})",
         value=(
@@ -881,11 +1017,14 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
         inline=False,
     )
 
-    # Discord puts a maximum of 3 inline fields on one row.
-    # Do not render empty groups: with 1–5 players the card stays compact,
-    # while 6–25 players naturally form the 3 + 2 group layout.
-    groups = [confirmed[i:i + 5] for i in range(0, len(confirmed), 5)]
-    for idx, group in enumerate(groups, start=1):
+
+    # Exactly six groups, maximum five players in each.
+    # Layout: Group 1 | Group 2
+    #         Group 3 | Group 4
+    #         Group 5 | Group 6
+    group_fields = {}
+    for group_no in range(1, 7):
+        group = [p for p in confirmed if int(p.get("group_no") or 1) == group_no]
         lines = []
         for p in group:
             pval = percentile_number(p.get("avg_parse"))
@@ -895,12 +1034,16 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
             if p.get("profile_url"):
                 name = f"[{name}]({p['profile_url']})"
             lines.append(f"{icons} **{parse_text}** {name}")
+        group_fields[group_no] = (f"Группа {group_no}", "\n".join(lines) or "—")
 
-        embed.add_field(
-            name=f"Группа {idx}",
-            value="\n".join(lines) or "—",
-            inline=True,
-        )
+    for left in (1, 3, 5):
+        right = left + 1
+        left_name, left_value = group_fields[left]
+        right_name, right_value = group_fields[right]
+        embed.add_field(name=left_name, value=left_value, inline=True)
+        embed.add_field(name=right_name, value=right_value, inline=True)
+        # Discord lays inline fields in rows of three; this spacer forces the next pair to a new row.
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
 
     # Show the remaining capacity without a wall of empty "Группа" fields.
     free_slots = max(0, RAID_LIMIT - len(confirmed))
@@ -910,12 +1053,12 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
         inline=False,
     )
 
-    # Statuses remain separate from the roster.
+    # Only the remaining status buttons are shown. The old "Не смогу"
+    # status is no longer exposed; cancellation removes the player entirely.
     status_sections = []
     for status, label, emoji in ((
         ("unsure", "НЕ УВЕРЕН", "⚖️"),
         ("late", "ОПОЗДАЮ", "🕐"),
-        ("cant", "НЕ СМОГУ", "❌"),
     )):
         users = [f"<@{p['discord_id']}>" for p in players if p.get("status") == status]
         if users:
@@ -950,7 +1093,7 @@ async def refresh_raid_message(channel: discord.abc.Messageable, channel_id: int
     except Exception:
         return
     await msg.edit(
-        embed=build_raid_embed(raid, players),
+        embed=await build_raid_embed(raid, players),
         view=raid_view_with_log(raid["raid_log"]),
     )
 
@@ -977,10 +1120,11 @@ class RaidSetupModal(discord.ui.Modal, title="Настройка рейда"):
             "difficulty_name": self.difficulty_name,
             "difficulty_id": diff_id,
             "leader_id": interaction.user.id,
+            "leader_name": interaction.user.display_name,
         })
         await interaction.response.send_message(
             content="@here",
-            embed=build_raid_embed(db.get_raid(interaction.channel_id), []),
+            embed=await build_raid_embed(db.get_raid(interaction.channel_id), []),
             view=raid_view_with_log(),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
@@ -1024,20 +1168,42 @@ class RaidCreateView(discord.ui.View):
         super().__init__(timeout=180)
         self.add_item(RaidSelect())
 
+# Русскоязычные реалмы EU. В Discord показываем русское название,
+# а в Warcraft Logs передаём стабильный английский slug.
+RU_REALMS = [
+    ("Азурегос", "azuregos"),
+    ("Вечная Песня", "eversong"),
+    ("Голдринн", "goldrinn"),
+    ("Гордунни", "gordunni"),
+    ("Гром", "grom"),
+    ("Король-лич", "lich-king"),
+    ("Пиратская бухта", "booty-bay"),
+    ("Свежеватель Душ", "soulflayer"),
+    ("Страж Смерти", "deathguard"),
+    ("Термоштепсель", "thermaplugg"),
+    ("Черный Шрам", "blackscar"),
+    ("Ясеневый лес", "ashenvale"),
+    ("Борейская тундра", "borean-tundra"),
+    ("Галакронд", "galakrond"),
+    ("Дракономор", "fordragon"),
+    ("Подземье", "deepholm"),
+    ("Разувий", "razuvious"),
+    ("Ревущий фьорд", "howling-fjord"),
+    ("Седогрив", "greymane"),
+    ("Ткач Смерти", "deathweaver"),
+]
+
+
 class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
     character_name = discord.ui.TextInput(label="Имя персонажа", placeholder="Имя персонажа", max_length=30)
-    realm = discord.ui.TextInput(
-        label="Реалм",
-        placeholder="howling-fjord или Ревущий фьорд",
-        default=WCL_DEFAULT_REALM,
-        max_length=40
-    )
 
-    def __init__(self, channel_id: int, class_name: str, spec_name: str):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, realm: str, replace_existing: bool = False):
         super().__init__()
         self.channel_id = channel_id
         self.class_name = class_name
         self.spec_name = spec_name
+        self.realm = realm
+        self.replace_existing = replace_existing
 
     async def on_submit(self, interaction: discord.Interaction):
         raid = db.get_raid(self.channel_id)
@@ -1045,11 +1211,9 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
             await interaction.response.send_message("❌ Рейд уже закрыт.", ephemeral=True)
             return
         old = db.get_player(self.channel_id, interaction.user.id)
-        if old:
-            await interaction.response.send_message("⚠️ Вы уже есть в списке.", ephemeral=True)
-            return
         confirmed = sum(1 for r in db.get_players(self.channel_id) if r["status"] == "confirmed")
-        if confirmed >= RAID_LIMIT:
+        # Replacing your own character does not consume an additional slot.
+        if confirmed >= RAID_LIMIT and not (old and old["status"] == "confirmed"):
             await interaction.response.send_message("❌ Рейд уже заполнен.", ephemeral=True)
             return
 
@@ -1059,7 +1223,7 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
         try:
             result = await wcl.character(
                 self.character_name.value.strip(),
-                self.realm.value.strip(),
+                self.realm,
                 WCL_REGION,
                 raid["raid_id"],
                 raid["difficulty_id"],
@@ -1078,6 +1242,13 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
             )
             return
 
+        group_no = int(old["group_no"] or 1) if old else 1
+        if not old:
+            for candidate in range(1, 7):
+                if len(db.get_group_players(self.channel_id, candidate)) < 5:
+                    group_no = candidate
+                    break
+
         db.upsert_player({
             "channel_id": self.channel_id,
             "discord_id": interaction.user.id,
@@ -1095,23 +1266,28 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
             "best_parse": result.get("best_parse"),
             "bosses": result.get("bosses", []),
             "profile_url": result.get("profile_url"),
+            "group_no": group_no,
         })
         channel = interaction.channel
         await refresh_raid_message(channel, self.channel_id)
 
         p = result.get("avg_parse")
+        action = "обновлён" if old else "записан"
         text = (
-            f"✅ **{result['character_name']}** записан.\n"
+            f"✅ **{result['character_name']}** {action}.\n"
             f"{cd['emoji']} {self.class_name} · {self.spec_name}\n"
             f"📈 Средний лог: **{p:.0f}**" if p is not None else
-            f"✅ **{result['character_name']}** записан.\n{cd['emoji']} {self.class_name} · {self.spec_name}\n📈 Лог: `—`"
+            f"✅ **{result['character_name']}** {action}.\n"
+            f"{cd['emoji']} {self.class_name} · {self.spec_name}\n"
+            f"📈 Лог: `—`"
         )
         await interaction.followup.send(text, ephemeral=True)
 
 class ClassSelect(discord.ui.Select):
-    def __init__(self, channel_id: int, guild_id: Optional[int] = None):
+    def __init__(self, channel_id: int, guild_id: Optional[int] = None, replace_existing: bool = False):
         self.channel_id = channel_id
         self.guild_id = guild_id
+        self.replace_existing = replace_existing
         guild = bot.get_guild(guild_id) if guild_id else None
         options = [
             discord.SelectOption(
@@ -1126,14 +1302,15 @@ class ClassSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.edit_message(
             content=f"Выбран класс **{self.values[0]}**. Выберите специализацию:",
-            view=SpecSelectView(self.channel_id, self.values[0], self.guild_id)
+            view=SpecSelectView(self.channel_id, self.values[0], self.guild_id, self.replace_existing)
         )
 
 class SpecSelect(discord.ui.Select):
-    def __init__(self, channel_id: int, class_name: str, guild_id: Optional[int] = None):
+    def __init__(self, channel_id: int, class_name: str, guild_id: Optional[int] = None, replace_existing: bool = False):
         self.channel_id = channel_id
         self.class_name = class_name
         self.guild_id = guild_id
+        self.replace_existing = replace_existing
         guild = bot.get_guild(guild_id) if guild_id else None
         options = [
             discord.SelectOption(
@@ -1146,20 +1323,64 @@ class SpecSelect(discord.ui.Select):
         super().__init__(placeholder="Выберите специализацию", options=options, custom_id="spec_select")
 
     async def callback(self, interaction: discord.Interaction):
-        # Important: a modal must be sent as the interaction response itself.
-        await interaction.response.send_modal(
-            CharacterModal(self.channel_id, self.class_name, self.values[0])
+        await interaction.response.edit_message(
+            content=f"Выбран класс **{self.class_name}**, специализация **{self.values[0]}**. Выберите сервер:",
+            view=RealmSelectView(
+                self.channel_id,
+                self.class_name,
+                self.values[0],
+                self.guild_id,
+                self.replace_existing,
+            )
         )
 
-class ClassSelectView(discord.ui.View):
-    def __init__(self, channel_id: int, guild_id: Optional[int] = None):
+
+class RealmSelect(discord.ui.Select):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, guild_id: Optional[int] = None, replace_existing: bool = False):
+        self.channel_id = channel_id
+        self.class_name = class_name
+        self.spec_name = spec_name
+        self.guild_id = guild_id
+        self.replace_existing = replace_existing
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=slug,
+                description=f"{name} — EU",
+                emoji="🌍",
+                default=(slug == WCL_DEFAULT_REALM),
+            )
+            for name, slug in RU_REALMS
+        ]
+        super().__init__(placeholder="Выберите сервер", options=options, custom_id="realm_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            CharacterModal(
+                self.channel_id,
+                self.class_name,
+                self.spec_name,
+                self.values[0],
+                self.replace_existing,
+            )
+        )
+
+
+class RealmSelectView(discord.ui.View):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, guild_id: Optional[int] = None, replace_existing: bool = False):
         super().__init__(timeout=180)
-        self.add_item(ClassSelect(channel_id, guild_id))
+        self.add_item(RealmSelect(channel_id, class_name, spec_name, guild_id, replace_existing))
+
+
+class ClassSelectView(discord.ui.View):
+    def __init__(self, channel_id: int, guild_id: Optional[int] = None, replace_existing: bool = False):
+        super().__init__(timeout=180)
+        self.add_item(ClassSelect(channel_id, guild_id, replace_existing))
 
 class SpecSelectView(discord.ui.View):
-    def __init__(self, channel_id: int, class_name: str, guild_id: Optional[int] = None):
+    def __init__(self, channel_id: int, class_name: str, guild_id: Optional[int] = None, replace_existing: bool = False):
         super().__init__(timeout=180)
-        self.add_item(SpecSelect(channel_id, class_name, guild_id))
+        self.add_item(SpecSelect(channel_id, class_name, guild_id, replace_existing))
 
 class JoinButton(discord.ui.Button):
     def __init__(self):
@@ -1171,19 +1392,22 @@ class JoinButton(discord.ui.Button):
             await interaction.response.send_message("❌ Рейд закрыт.", ephemeral=True)
             return
         existing = db.get_player(interaction.channel_id, interaction.user.id)
-        if existing:
-            if existing["status"] != "confirmed":
-                db.set_status(interaction.channel_id, interaction.user.id, "confirmed")
-                await refresh_raid_message(interaction.channel, interaction.channel_id)
-                await interaction.response.send_message("✅ Вы снова подтверждены в составе.", ephemeral=True)
-            else:
-                await interaction.response.send_message("⚠️ Вы уже подтверждены в составе.", ephemeral=True)
-            return
         confirmed = sum(1 for r in db.get_players(interaction.channel_id) if r["status"] == "confirmed")
-        if confirmed >= RAID_LIMIT:
+        if confirmed >= RAID_LIMIT and not (existing and existing["status"] == "confirmed"):
             await interaction.response.send_message("❌ Рейд заполнен.", ephemeral=True)
             return
-        await interaction.response.send_message("Выберите класс:", view=ClassSelectView(interaction.channel_id, interaction.guild_id), ephemeral=True)
+        if existing:
+            await interaction.response.send_message(
+                "Вы уже записаны. Выберите нового персонажа — текущая запись будет заменена:",
+                view=ClassSelectView(interaction.channel_id, interaction.guild_id, replace_existing=True),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "Выберите класс:",
+            view=ClassSelectView(interaction.channel_id, interaction.guild_id),
+            ephemeral=True,
+        )
 
 class StatusButton(discord.ui.Button):
     def __init__(self, status: str, label: str, emoji: str, style=discord.ButtonStyle.secondary):
@@ -1201,14 +1425,138 @@ class StatusButton(discord.ui.Button):
                 "Сначала нажми **Запись** и добавь персонажа.", ephemeral=True
             )
             return
-        if self.status == "cant":
-            db.set_status(interaction.channel_id, interaction.user.id, "cant")
-        else:
-            db.set_status(interaction.channel_id, interaction.user.id, self.status)
+        db.set_status(interaction.channel_id, interaction.user.id, self.status)
         await refresh_raid_message(interaction.channel, interaction.channel_id)
         await interaction.response.send_message(
             f"Статус изменён: {STATUS_LABELS[self.status][1]} **{STATUS_LABELS[self.status][0]}**",
             ephemeral=True
+        )
+
+class CancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Отмена записи",
+            style=discord.ButtonStyle.danger,
+            emoji="🚫",
+            custom_id="raid_cancel",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        raid = db.get_raid(interaction.channel_id)
+        if not raid or raid["closed"]:
+            await interaction.response.send_message("❌ Рейд закрыт.", ephemeral=True)
+            return
+
+        player = db.get_player(interaction.channel_id, interaction.user.id)
+        if not player:
+            await interaction.response.send_message("Вы не записаны в этот рейд.", ephemeral=True)
+            return
+
+        db.remove_player(interaction.channel_id, interaction.user.id)
+        await refresh_raid_message(interaction.channel, interaction.channel_id)
+        await interaction.response.send_message("✅ Ваша запись отменена.", ephemeral=True)
+
+
+class GroupSourceSelect(discord.ui.Select):
+    def __init__(self, channel_id: int):
+        self.channel_id = channel_id
+        options = [discord.SelectOption(label=f"Группа {i}", value=str(i), emoji="👥") for i in range(1, 7)]
+        super().__init__(placeholder="Выберите группу игрока", options=options, custom_id="raid_group_source")
+
+    async def callback(self, interaction: discord.Interaction):
+        group_no = int(self.values[0])
+        players = db.get_group_players(self.channel_id, group_no)
+        if not players:
+            await interaction.response.edit_message(content=f"Группа {group_no} пуста.", view=GroupSourceView(self.channel_id))
+            return
+        options = []
+        for p in players:
+            label = str(p["character_name"])[:100]
+            options.append(discord.SelectOption(label=label, value=str(p["discord_id"]), description=f"{p['class_name']} · {p['spec_name']}"[:100]))
+        await interaction.response.edit_message(
+            content=f"**Группа {group_no}** — выберите игрока для перемещения:",
+            view=GroupPlayerView(self.channel_id, group_no, options),
+        )
+
+class GroupSourceView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=180)
+        self.add_item(GroupSourceSelect(channel_id))
+
+class GroupPlayerSelect(discord.ui.Select):
+    def __init__(self, channel_id: int, source_group: int, options):
+        self.channel_id = channel_id
+        self.source_group = source_group
+        super().__init__(placeholder="Выберите игрока", options=options, custom_id=f"raid_group_player_{source_group}")
+
+    async def callback(self, interaction: discord.Interaction):
+        player_id = int(self.values[0])
+        player = db.get_player(self.channel_id, player_id)
+        if not player:
+            await interaction.response.edit_message(content="❌ Игрок уже не найден.", view=GroupSourceView(self.channel_id))
+            return
+        await interaction.response.edit_message(
+            content=f"Перемещаем **{player['character_name']}**. Выберите новую группу:",
+            view=GroupDestinationView(self.channel_id, player_id, self.source_group),
+        )
+
+class GroupPlayerView(discord.ui.View):
+    def __init__(self, channel_id: int, source_group: int, options):
+        super().__init__(timeout=180)
+        self.add_item(GroupPlayerSelect(channel_id, source_group, options))
+
+class GroupDestinationSelect(discord.ui.Select):
+    def __init__(self, channel_id: int, player_id: int, source_group: int):
+        self.channel_id = channel_id
+        self.player_id = player_id
+        self.source_group = source_group
+        options = [
+            discord.SelectOption(label=f"Группа {i}", value=str(i), emoji="👥", default=(i == source_group))
+            for i in range(1, 7)
+        ]
+        super().__init__(placeholder="Выберите новую группу", options=options, custom_id=f"raid_group_dest_{player_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        destination = int(self.values[0])
+        player = db.get_player(self.channel_id, self.player_id)
+        if not player:
+            await interaction.response.edit_message(content="❌ Игрок уже не найден.", view=GroupSourceView(self.channel_id))
+            return
+        if destination != self.source_group and len(db.get_group_players(self.channel_id, destination)) >= 5:
+            await interaction.response.edit_message(
+                content=f"❌ Группа {destination} уже заполнена (5/5). Выберите другую:",
+                view=GroupDestinationView(self.channel_id, self.player_id, self.source_group),
+            )
+            return
+        db.set_group(self.channel_id, self.player_id, destination)
+        channel = interaction.channel
+        await refresh_raid_message(channel, self.channel_id)
+        await interaction.response.edit_message(
+            content=f"✅ **{player['character_name']}** перемещён в **Группу {destination}**.",
+            view=GroupSourceView(self.channel_id),
+        )
+
+class GroupDestinationView(discord.ui.View):
+    def __init__(self, channel_id: int, player_id: int, source_group: int):
+        super().__init__(timeout=180)
+        self.add_item(GroupDestinationSelect(channel_id, player_id, source_group))
+
+class GroupManageButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Группы", style=discord.ButtonStyle.secondary, emoji="👥", custom_id="raid_groups")
+
+    async def callback(self, interaction: discord.Interaction):
+        raid = db.get_raid(interaction.channel_id)
+        if not raid or raid["closed"]:
+            await interaction.response.send_message("❌ Рейд закрыт.", ephemeral=True)
+            return
+        if raid["leader_id"] != interaction.user.id and not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Только лидер рейда или модератор может менять группы.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Выберите группу, из которой нужно переместить игрока:",
+            view=GroupSourceView(interaction.channel_id),
+            ephemeral=True,
         )
 
 class WebButton(discord.ui.Button):
@@ -1219,9 +1567,10 @@ class RaidView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(JoinButton())
+        self.add_item(CancelButton())
         self.add_item(StatusButton("unsure", "Не уверен", "⚖️"))
         self.add_item(StatusButton("late", "Опоздаю", "🕐"))
-        self.add_item(StatusButton("cant", "Не смогу", "❌"))
+        self.add_item(GroupManageButton())
         self.add_item(WebButton())
 
 class AddLogModal(discord.ui.Modal, title="Добавить Warcraft Logs"):
@@ -1307,7 +1656,7 @@ async def raid_close(interaction: discord.Interaction):
     players = [make_player_dict(r) for r in db.get_players(interaction.channel_id)]
     msg = await interaction.channel.fetch_message(raid["message_id"])
     await msg.edit(
-        embed=build_raid_embed(raid, players),
+        embed=await build_raid_embed(raid, players),
         view=None
     )
     await interaction.response.send_message("🔒 Набор закрыт.", ephemeral=True)
@@ -1517,6 +1866,15 @@ async def _setup_hook():
     await wcl.start()
     await load_raid_images()
     bot.add_view(raid_view_with_log())
+    # Refresh active raid messages once on startup so old button layouts
+    # (including the removed "Не смогу" button) are replaced immediately.
+    for raid in db.active_raids():
+        channel = bot.get_channel(raid["channel_id"])
+        if channel:
+            try:
+                await refresh_raid_message(channel, raid["channel_id"])
+            except Exception as e:
+                print(f"[startup refresh] {raid['channel_id']}: {e}")
     if DISCORD_GUILD_ID:
         guild = discord.Object(id=int(DISCORD_GUILD_ID))
         bot.tree.copy_global_to(guild=guild)
