@@ -17,17 +17,13 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Всегда ищем .env рядом с bot.py
+# Локально можно использовать .env, но на Railway секреты приходят
+# через Service Variables, поэтому .env там НЕ обязателен.
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 
-if not ENV_FILE.exists():
-    raise SystemExit(
-        f"Файл .env не найден!\n"
-        f"Ожидаемый путь:\n{ENV_FILE}"
-    )
-
-load_dotenv(dotenv_path=ENV_FILE, override=True)
+if ENV_FILE.exists():
+    load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 WCL_CLIENT_ID = os.getenv("WCL_CLIENT_ID", "").strip()
@@ -36,7 +32,7 @@ WCL_SITE = os.getenv("WCL_SITE", "https://www.warcraftlogs.com").rstrip("/")
 WCL_API = os.getenv("WCL_API", f"{WCL_SITE}/api/v2/client").rstrip("/")
 WCL_REGION = os.getenv("WCL_REGION", "eu").strip().lower()
 WCL_DEFAULT_REALM = os.getenv("WCL_DEFAULT_REALM", "howling-fjord").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "raids.sqlite3")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/raids.sqlite3")
 REFRESH_MINUTES = max(5, int(os.getenv("REFRESH_MINUTES", "15")))
 RAID_LIMIT = max(1, min(40, int(os.getenv("RAID_LIMIT", "25"))))
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
@@ -46,8 +42,9 @@ if not DISCORD_TOKEN:
 if not WCL_CLIENT_ID or not WCL_CLIENT_SECRET:
     raise SystemExit("WCL_CLIENT_ID/WCL_CLIENT_SECRET не заданы. Создайте OAuth Client в Warcraft Logs.")
 print(f"[CONFIG] bot.py: {Path(__file__).resolve()}")
-print(f"[CONFIG] .env:   {ENV_FILE}")
-print(f"[CONFIG] .env существует: {ENV_FILE.exists()}")
+print(f"[CONFIG] .env: {ENV_FILE} (не обязателен на Railway)")
+print(f"[CONFIG] .env найден: {ENV_FILE.exists()}")
+print(f"[CONFIG] DATABASE_PATH: {DATABASE_PATH}")
 print(f"[CONFIG] Discord token: {'OK' if DISCORD_TOKEN else 'НЕ НАЙДЕН'}")
 print(f"[CONFIG] WCL Client ID: {'OK' if WCL_CLIENT_ID else 'НЕ НАЙДЕН'}")
 print(f"[CONFIG] WCL Secret: {'OK' if WCL_CLIENT_SECRET else 'НЕ НАЙДЕН'}")
