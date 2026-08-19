@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-20-full-raid-fix-v3"
+CODE_VERSION = "2026-08-20-full-raid-fix-v4-wcl-zone-fix"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -221,7 +221,6 @@ SPEC_ROLE = {
 
 STATUS_LABELS = {
     "confirmed": ("Записан", "👥"),
-    "unsure": ("Не уверен", "⚖️"),
     "late": ("Опоздаю", "🕐"),
     "cant": ("Не смогу", "❌"),
 }
@@ -831,13 +830,34 @@ class WCLClient:
         if not code:
             raise ValueError("Не нашёл код отчёта в ссылке Warcraft Logs.")
         report = await self.report(code)
-        expected_zone = RAIDS[raid_id]["zone_id"]
-        if not report.get("zone") or report["zone"]["id"] != expected_zone:
+        expected_zone = int(RAIDS[raid_id]["zone_id"])
+        report_zone = report.get("zone") or {}
+        report_zone_id_raw = report_zone.get("id")
+        try:
+            report_zone_id = int(report_zone_id_raw)
+        except (TypeError, ValueError):
+            report_zone_id = None
+
+        # Warcraft Logs can return the zone ID through GraphQL as either an
+        # integer or a string depending on the API response/schema version.
+        # Normalize it before comparing so a valid log is not rejected with
+        # a false "zone mismatch" error (e.g. "54" != 54 in Python).
+        zone_id_matches = report_zone_id == expected_zone
+
+        # As an additional safeguard, accept an exact zone-name match. This
+        # is useful for reports created during WCL's zone/tier transitions.
+        expected_zone_name = RAIDS[raid_id]["name_en"].strip().casefold()
+        report_zone_name = str(report_zone.get("name") or "").strip().casefold()
+        zone_name_matches = report_zone_name == expected_zone_name
+
+        if not report_zone or not (zone_id_matches or zone_name_matches):
             raise RuntimeError(
-                f"Этот лог относится к зоне {report.get('zone', {}).get('name', 'неизвестно')}, "
-                f"а выбранный рейд относится к зоне {expected_zone}."
+                f"Этот лог относится к зоне {report_zone.get('name', 'неизвестно')} "
+                f"(ID {report_zone_id_raw}), а выбранный рейд относится к зоне "
+                f"{RAIDS[raid_id]['name_en']} (ID {expected_zone})."
             )
-        valid_encounters = {e["id"]: e["name"] for e in (report["zone"].get("encounters") or [])}
+
+        valid_encounters = {e["id"]: e["name"] for e in (report_zone.get("encounters") or [])}
         kills = []
         for fight in report.get("fights") or []:
             if not fight.get("kill"):
@@ -853,7 +873,7 @@ class WCLClient:
         return {
             "code": code,
             "title": report["title"],
-            "zone": report["zone"]["name"],
+            "zone": report_zone["name"],
             "kills": list(unique.values()),
             "total": len(unique),
             "url": f"https://www.warcraftlogs.com/reports/{code}",
@@ -1355,15 +1375,50 @@ class RealmSelect(discord.ui.Select):
         super().__init__(placeholder="Выберите сервер", options=options, custom_id="realm_select")
 
     async def callback(self, interaction: discord.Interaction):
+        # Immediately ask for the character name after the realm is selected.
+        try:
+            await interaction.response.send_modal(
+                CharacterModal(
+                    self.channel_id,
+                    self.class_name,
+                    self.spec_name,
+                    self.values[0],
+                    self.replace_existing,
+                )
+            )
+        except Exception as e:
+            print(f"[UI] Failed to open character-name modal: {type(e).__name__}: {e}")
+            view = CharacterNameFallbackView(
+                self.channel_id, self.class_name, self.spec_name, self.values[0], self.replace_existing
+            )
+            message = "Сервер выбран. Нажмите **Ввести имя персонажа**, чтобы указать ник персонажа."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, view=view, ephemeral=True)
+
+
+class CharacterNameFallbackButton(discord.ui.Button):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, realm: str, replace_existing: bool):
+        super().__init__(label="Ввести имя персонажа", style=discord.ButtonStyle.primary, emoji="✏️")
+        self.channel_id = channel_id
+        self.class_name = class_name
+        self.spec_name = spec_name
+        self.realm = realm
+        self.replace_existing = replace_existing
+
+    async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
             CharacterModal(
-                self.channel_id,
-                self.class_name,
-                self.spec_name,
-                self.values[0],
-                self.replace_existing,
+                self.channel_id, self.class_name, self.spec_name, self.realm, self.replace_existing
             )
         )
+
+
+class CharacterNameFallbackView(discord.ui.View):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, realm: str, replace_existing: bool):
+        super().__init__(timeout=180)
+        self.add_item(CharacterNameFallbackButton(channel_id, class_name, spec_name, realm, replace_existing))
 
 
 class RealmSelectView(discord.ui.View):
@@ -1559,19 +1614,13 @@ class GroupManageButton(discord.ui.Button):
             ephemeral=True,
         )
 
-class WebButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="Web", style=discord.ButtonStyle.link, emoji="🌐", url=WCL_SITE)
-
 class RaidView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(JoinButton())
         self.add_item(CancelButton())
-        self.add_item(StatusButton("unsure", "Не уверен", "⚖️"))
         self.add_item(StatusButton("late", "Опоздаю", "🕐"))
         self.add_item(GroupManageButton())
-        self.add_item(WebButton())
 
 class AddLogModal(discord.ui.Modal, title="Добавить Warcraft Logs"):
     url = discord.ui.TextInput(
