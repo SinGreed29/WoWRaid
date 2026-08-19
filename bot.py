@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-20-full-raid-fix-v4-wcl-zone-fix"
+CODE_VERSION = "2026-08-20-full-raid-fix-v6-ephemeral-raid-create"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -502,7 +502,7 @@ class DB:
         self.conn.execute("""
         INSERT INTO raids
         (channel_id,guild_id,name,date_text,raid_id,difficulty_name,difficulty_id,leader_id,leader_name,message_id,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
             data["channel_id"], data["guild_id"], data["name"], data["date_text"],
             data["raid_id"], data["difficulty_name"], data["difficulty_id"],
@@ -1368,7 +1368,6 @@ class RealmSelect(discord.ui.Select):
                 value=slug,
                 description=f"{name} — EU",
                 emoji="🌍",
-                default=(slug == WCL_DEFAULT_REALM),
             )
             for name, slug in RU_REALMS
         ]
@@ -1690,7 +1689,7 @@ async def raid_create(interaction: discord.Interaction):
     if db.get_raid(interaction.channel_id):
         await interaction.response.send_message("⚠️ В этом канале уже есть активный рейд.", ephemeral=True)
         return
-    await interaction.response.send_message("🏛️ **Выберите рейд:**", view=RaidCreateView())
+    await interaction.response.send_message("🏛️ **Выберите рейд:**", view=RaidCreateView(), ephemeral=True)
 
 @bot.tree.command(name="raid_close", description="Закрыть набор")
 async def raid_close(interaction: discord.Interaction):
