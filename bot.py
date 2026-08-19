@@ -17,13 +17,17 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Локально можно использовать .env, но на Railway секреты приходят
-# через Service Variables, поэтому .env там НЕ обязателен.
+# Всегда ищем .env рядом с bot.py
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 
-if ENV_FILE.exists():
-    load_dotenv(dotenv_path=ENV_FILE, override=False)
+if not ENV_FILE.exists():
+    raise SystemExit(
+        f"Файл .env не найден!\n"
+        f"Ожидаемый путь:\n{ENV_FILE}"
+    )
+
+load_dotenv(dotenv_path=ENV_FILE, override=True)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 WCL_CLIENT_ID = os.getenv("WCL_CLIENT_ID", "").strip()
@@ -32,7 +36,7 @@ WCL_SITE = os.getenv("WCL_SITE", "https://www.warcraftlogs.com").rstrip("/")
 WCL_API = os.getenv("WCL_API", f"{WCL_SITE}/api/v2/client").rstrip("/")
 WCL_REGION = os.getenv("WCL_REGION", "eu").strip().lower()
 WCL_DEFAULT_REALM = os.getenv("WCL_DEFAULT_REALM", "howling-fjord").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/raids.sqlite3")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "raids.sqlite3")
 REFRESH_MINUTES = max(5, int(os.getenv("REFRESH_MINUTES", "15")))
 RAID_LIMIT = max(1, min(40, int(os.getenv("RAID_LIMIT", "25"))))
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
@@ -42,9 +46,8 @@ if not DISCORD_TOKEN:
 if not WCL_CLIENT_ID or not WCL_CLIENT_SECRET:
     raise SystemExit("WCL_CLIENT_ID/WCL_CLIENT_SECRET не заданы. Создайте OAuth Client в Warcraft Logs.")
 print(f"[CONFIG] bot.py: {Path(__file__).resolve()}")
-print(f"[CONFIG] .env: {ENV_FILE} (не обязателен на Railway)")
-print(f"[CONFIG] .env найден: {ENV_FILE.exists()}")
-print(f"[CONFIG] DATABASE_PATH: {DATABASE_PATH}")
+print(f"[CONFIG] .env:   {ENV_FILE}")
+print(f"[CONFIG] .env существует: {ENV_FILE.exists()}")
 print(f"[CONFIG] Discord token: {'OK' if DISCORD_TOKEN else 'НЕ НАЙДЕН'}")
 print(f"[CONFIG] WCL Client ID: {'OK' if WCL_CLIENT_ID else 'НЕ НАЙДЕН'}")
 print(f"[CONFIG] WCL Secret: {'OK' if WCL_CLIENT_SECRET else 'НЕ НАЙДЕН'}")
@@ -753,45 +756,13 @@ class WCLClient:
         if not code:
             raise ValueError("Не нашёл код отчёта в ссылке Warcraft Logs.")
         report = await self.report(code)
-        report_zone = report.get("zone") or {}
         expected_zone = RAIDS[raid_id]["zone_id"]
-
-        # Warcraft Logs groups Voidspire, Dreamrift and March on Quel'Danas
-        # under the same zone (46). Sporefall and Venomous Abyss have their
-        # own zones. Therefore the zone ID alone is not enough to identify
-        # the selected raid.
-        allowed_zone_ids = {
-            "voidspire": {46},
-            "dreamrift": {46},
-            "quelthalas": {46},
-            "sporefall": {50},
-            "venomous_abyss": {54},
-        }
-
-        if report_zone.get("id") not in allowed_zone_ids.get(raid_id, {expected_zone}):
+        if not report.get("zone") or report["zone"]["id"] != expected_zone:
             raise RuntimeError(
-                f"❌ Лог относится к зоне **{report_zone.get('name', 'неизвестно')}** "
-                f"(ID {report_zone.get('id', '—')}), а выбран рейд **{RAIDS[raid_id]['name']}**."
+                f"Этот лог относится к зоне {report.get('zone', {}).get('name', 'неизвестно')}, "
+                f"а выбранный рейд относится к зоне {expected_zone}."
             )
-
-        valid_encounters = {
-            e["id"]: e["name"]
-            for e in (report_zone.get("encounters") or [])
-        }
-
-        # For the combined Midnight zone (46), determine which raid the report
-        # actually contains by its killed bosses. This prevents attaching a
-        # Dreamrift log to Voidspire, etc.
-        raid_boss_keywords = {
-            "voidspire": {
-                "Imperator Averzian", "Vorasius", "Fallen-King Salhadaar",
-                "Vaelgor & Ezzorak", "Lightblinded Vanguard",
-                "Crown of the Cosmos"
-            },
-            "dreamrift": {"Chimaerus, the Undreamt God"},
-            "quelthalas": {"Belo'ren, Child of Al'ar", "Midnight Falls"},
-        }
-
+        valid_encounters = {e["id"]: e["name"] for e in (report["zone"].get("encounters") or [])}
         kills = []
         for fight in report.get("fights") or []:
             if not fight.get("kill"):
@@ -800,26 +771,7 @@ class WCLClient:
                 continue
             eid = fight.get("encounterID")
             if eid in valid_encounters:
-                boss_name = str(valid_encounters[eid])
-                kills.append({
-                    "id": eid,
-                    "name": boss_name,
-                    "fight_id": fight["id"]
-                })
-
-        if raid_id in raid_boss_keywords and report_zone.get("id") == 46:
-            expected_bosses = raid_boss_keywords[raid_id]
-            raid_kills = [k for k in kills if k["name"] in expected_bosses]
-
-            if not raid_kills:
-                actual = ", ".join(k["name"] for k in kills) or "убитых боссов не найдено"
-                raise RuntimeError(
-                    f"❌ Этот лог не содержит боссов рейда **{RAIDS[raid_id]['name']}**.\n"
-                    f"Найдено в логе: **{actual}**."
-                )
-
-            # Keep only kills belonging to the selected raid.
-            kills = raid_kills
+                kills.append({"id": eid, "name": valid_encounters[eid], "fight_id": fight["id"]})
         unique = {}
         for k in kills:
             unique[k["id"]] = k
@@ -889,7 +841,7 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
     embed.description = (
         f"`{raid['difficulty_name']}` · **{raid['date_text']}**\n"
         f"**Средний лог рейда:** {avg_text}\n"
-        f"**Опыт рейда:** `{info['name']}` · {info.get('name_en', '')}"
+        f"**Рейд:** `{info['name']}` · {info.get('name_en', '')}"
     )
 
     # Compact boss summary: one line per boss, like the reference screenshot.
@@ -929,24 +881,34 @@ def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
         inline=False,
     )
 
-    # Exactly five groups. Each row is: class icon + spec icon + parse + name.
+    # Discord puts a maximum of 3 inline fields on one row.
+    # Do not render empty groups: with 1–5 players the card stays compact,
+    # while 6–25 players naturally form the 3 + 2 group layout.
     groups = [confirmed[i:i + 5] for i in range(0, len(confirmed), 5)]
-    for idx in range(5):
-        group = groups[idx] if idx < len(groups) else []
-        if not group:
-            value = "—"
-        else:
-            lines = []
-            for p in group:
-                pval = percentile_number(p.get("avg_parse"))
-                parse_text = f"{pval:.0f}" if pval is not None else "—"
-                icons = player_icons(guild, p)
-                name = str(p.get("character_name") or "Неизвестный")
-                if p.get("profile_url"):
-                    name = f"[{name}]({p['profile_url']})"
-                lines.append(f"{icons} **{parse_text}** {name}")
-            value = "\n".join(lines)
-        embed.add_field(name=f"Группа {idx + 1}", value=value, inline=True)
+    for idx, group in enumerate(groups, start=1):
+        lines = []
+        for p in group:
+            pval = percentile_number(p.get("avg_parse"))
+            parse_text = f"{pval:.0f}" if pval is not None else "—"
+            icons = player_icons(guild, p)
+            name = str(p.get("character_name") or "Неизвестный")
+            if p.get("profile_url"):
+                name = f"[{name}]({p['profile_url']})"
+            lines.append(f"{icons} **{parse_text}** {name}")
+
+        embed.add_field(
+            name=f"Группа {idx}",
+            value="\n".join(lines) or "—",
+            inline=True,
+        )
+
+    # Show the remaining capacity without a wall of empty "Группа" fields.
+    free_slots = max(0, RAID_LIMIT - len(confirmed))
+    embed.add_field(
+        name="Свободные места",
+        value=f"**{free_slots}** из **{RAID_LIMIT}**",
+        inline=False,
+    )
 
     # Statuses remain separate from the roster.
     status_sections = []
@@ -1017,8 +979,10 @@ class RaidSetupModal(discord.ui.Modal, title="Настройка рейда"):
             "leader_id": interaction.user.id,
         })
         await interaction.response.send_message(
+            content="@here",
             embed=build_raid_embed(db.get_raid(interaction.channel_id), []),
-            view=raid_view_with_log()
+            view=raid_view_with_log(),
+            allowed_mentions=discord.AllowedMentions(everyone=True),
         )
         msg = await interaction.original_response()
         db.set_message(interaction.channel_id, msg.id)
