@@ -711,11 +711,29 @@ class WCLClient:
 
     async def character(self, name: str, realm: str, region: str, raid_id: str, difficulty_id: int,
                         wcl_class: str, wcl_spec: str) -> dict:
+        """Fetch character rankings with a compatibility fallback for WCL zone IDs.
+
+        The current Venomous Abyss rankings page uses zone 54, while character
+        profile/history links can still expose the same raid under zone 53.
+        We therefore try the raid's configured zone first and, for Venomous
+        Abyss only, fall back to zone 53 when no rankings are returned.
+
+        Class/spec filters are deliberately omitted here. WCL can have slightly
+        different historical spec labels, and filtering at the API level can
+        make an existing character parse disappear. The character itself is
+        already known, so we safely collect its rankings and let the UI display
+        the stored class/spec.
+        """
         raid = RAIDS[raid_id]
+
+        zone_candidates = [raid["zone_id"]]
+        if raid_id == "venomous_abyss" and 53 not in zone_candidates:
+            zone_candidates.append(53)
+
         q = """
         query Character(
           $name:String!, $server:String!, $region:String!,
-          $zone:Int!, $difficulty:Int!, $class:String!, $spec:String!
+          $zone:Int!, $difficulty:Int!
         ) {
           characterData {
             character(name:$name, serverSlug:$server, serverRegion:$region) {
@@ -724,36 +742,54 @@ class WCLClient:
               zoneRankings(
                 zoneID:$zone
                 difficulty:$difficulty
-                className:$class
-                specName:$spec
               )
             }
           }
         }
         """
-        # Warcraft Logs expects className/specName as slugs, not display names
-        # such as "Mage", "DeathKnight" or "Frost".  The old code passed
-        # those display names directly, which can make zoneRankings come back
-        # empty even though the character already has public logs.
-        wcl_class_slug = re.sub(r"[^a-z0-9]", "", (wcl_class or "").lower())
-        wcl_spec_slug = re.sub(r"[^a-z0-9]", "", (wcl_spec or "").lower())
 
-        data = await self.graphql(q, {
-            "name": name, "server": normalize_realm(realm), "region": region,
-            "zone": raid["zone_id"], "difficulty": difficulty_id,
-            "class": wcl_class_slug, "spec": wcl_spec_slug,
-        })
-        char = ((data.get("characterData") or {}).get("character"))
-        if not char:
-            return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
+        char = None
+        rankings = {}
+        used_zone = raid["zone_id"]
+        last_error = None
 
-        rankings = char.get("zoneRankings")
-        if isinstance(rankings, str):
+        for zone_id in zone_candidates:
             try:
-                rankings = json.loads(rankings)
-            except json.JSONDecodeError:
-                rankings = {}
-        rankings = rankings or {}
+                data = await self.graphql(q, {
+                    "name": name,
+                    "server": normalize_realm(realm),
+                    "region": region,
+                    "zone": zone_id,
+                    "difficulty": difficulty_id,
+                })
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+            char = ((data.get("characterData") or {}).get("character"))
+            if not char:
+                return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
+
+            raw = char.get("zoneRankings")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    raw = {}
+            rankings = raw or {}
+
+            raw_rankings = rankings.get("rankings") or []
+            all_stars = rankings.get("allStars") or []
+            if raw_rankings or all_stars or rankings.get("rankPercent") is not None:
+                used_zone = zone_id
+                break
+
+            # For Venomous Abyss, an empty zone 54 result is retried against
+            # the legacy/profile zone 53. For every other raid we stop here.
+            used_zone = zone_id
+
+        if not char:
+            return {"found": False, "error": last_error or "Не удалось получить персонажа из Warcraft Logs."}
 
         bosses = []
         raw_rankings = rankings.get("rankings") or []
@@ -765,6 +801,19 @@ class WCLClient:
                 "percentile": p,
                 "amount": item.get("bestAmount", item.get("amount")),
             })
+
+        # Some WCL responses expose All Stars separately. Keep it as a
+        # fallback so a character with All Stars but no normal ranking list
+        # is not treated as having no logs.
+        if not bosses:
+            for item in (rankings.get("allStars") or []):
+                boss_name = normalize_boss_name(item.get("encounter", item.get("boss", "Все боссы")))
+                p = percentile_number(item.get("rankPercent", item.get("percentile", item.get("performance"))))
+                bosses.append({
+                    "boss": boss_name,
+                    "percentile": p,
+                    "amount": item.get("bestAmount", item.get("amount")),
+                })
 
         values = [b["percentile"] for b in bosses if b["percentile"] is not None]
         avg = rankings.get("medianPerformance")
@@ -778,7 +827,14 @@ class WCLClient:
             best = max(values)
 
         server_slug = char["server"]["slug"]
-        profile = f"{WCL_SITE}/character/{region}/{server_slug}/{char['name']}?zone={raid['zone_id']}"
+        profile = f"{WCL_SITE}/character/{region}/{server_slug}/{char['name']}?zone={used_zone}"
+
+        print(
+            f"[WCL character] {char.get('name')} / {char.get('server', {}).get('name')} "
+            f"raid={raid_id} difficulty={difficulty_id} zone={used_zone} "
+            f"rankings={len(raw_rankings)} allStars={len(rankings.get('allStars') or [])}"
+        )
+
         return {
             "found": True,
             "character_name": char["name"],
