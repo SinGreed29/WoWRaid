@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-20-medianPerformanceAverage-v9"
+CODE_VERSION = "2026-08-20-metric-retry-v10"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -728,57 +728,56 @@ class WCLClient:
     async def character(self, name: str, realm: str, region: str, raid_id: str, difficulty_id: int,
                         wcl_class: str, wcl_spec: str) -> dict:
         raid = RAIDS[raid_id]
+        role = role_for_spec(wcl_spec)
+        # Try role-appropriate metrics first, then a couple of fallbacks.
+        # Website "Урон" view uses dps even for some tanks; tankhps/hps for tanks/heals.
+        if role == "Танк":
+            metrics_to_try = ["dps", "tankhps", "hps"]
+        elif role == "Хил":
+            metrics_to_try = ["hps", "dps"]
+        else:
+            metrics_to_try = ["dps", "hps"]
 
-        async def _fetch_rankings(use_spec_filter: bool) -> tuple:
+        async def _fetch_rankings(metric: Optional[str], use_spec_filter: bool, partition: Optional[int] = None) -> tuple:
+            metric_arg = "metric: $metric" if metric else ""
+            partition_arg = "partition: $partition" if partition is not None else ""
+            class_arg = "className: $class\n                        specName: $spec" if use_spec_filter else ""
+            var_decls = [
+                "$name:String!", "$server:String!", "$region:String!",
+                "$zone:Int!", "$difficulty:Int!",
+            ]
+            variables = {
+                "name": name, "server": normalize_realm(realm), "region": region,
+                "zone": raid["zone_id"], "difficulty": difficulty_id,
+            }
             if use_spec_filter:
-                q = """
-                query Character(
-                  $name:String!, $server:String!, $region:String!,
-                  $zone:Int!, $difficulty:Int!, $class:String!, $spec:String!
-                ) {
-                  characterData {
-                    character(name:$name, serverSlug:$server, serverRegion:$region) {
-                      id name hidden classID level
-                      server { name slug normalizedName region { name slug } }
-                      zoneRankings(
-                        zoneID:$zone
-                        difficulty:$difficulty
-                        className:$class
-                        specName:$spec
-                      )
-                    }
-                  }
-                }
-                """
-                variables = {
-                    "name": name, "server": normalize_realm(realm), "region": region,
-                    "zone": raid["zone_id"], "difficulty": difficulty_id,
-                    "class": wcl_class, "spec": wcl_spec,
-                }
-            else:
-                # Fallback: no class/spec filter. Early-tier WCL responses sometimes
-                # omit filtered rankings even when the character page shows numbers.
-                q = """
-                query Character(
-                  $name:String!, $server:String!, $region:String!,
-                  $zone:Int!, $difficulty:Int!
-                ) {
-                  characterData {
-                    character(name:$name, serverSlug:$server, serverRegion:$region) {
-                      id name hidden classID level
-                      server { name slug normalizedName region { name slug } }
-                      zoneRankings(
-                        zoneID:$zone
-                        difficulty:$difficulty
-                      )
-                    }
-                  }
-                }
-                """
-                variables = {
-                    "name": name, "server": normalize_realm(realm), "region": region,
-                    "zone": raid["zone_id"], "difficulty": difficulty_id,
-                }
+                var_decls.extend(["$class:String!", "$spec:String!"])
+                variables["class"] = wcl_class
+                variables["spec"] = wcl_spec
+            if metric:
+                var_decls.append("$metric:CharacterPageRankingMetricType")
+                variables["metric"] = metric
+            if partition is not None:
+                var_decls.append("$partition:Int")
+                variables["partition"] = partition
+
+            q = f"""
+            query Character({', '.join(var_decls)}) {{
+              characterData {{
+                character(name:$name, serverSlug:$server, serverRegion:$region) {{
+                  id name hidden classID level
+                  server {{ name slug normalizedName region {{ name slug }} }}
+                  zoneRankings(
+                    zoneID:$zone
+                    difficulty:$difficulty
+                    {class_arg}
+                    {metric_arg}
+                    {partition_arg}
+                  )
+                }}
+              }}
+            }}
+            """
             data = await self.graphql(q, variables)
             char = ((data.get("characterData") or {}).get("character"))
             if not char:
@@ -792,7 +791,6 @@ class WCLClient:
             return char, rankings or {}
 
         def _item_percentile(item: dict) -> Optional[float]:
-            # WCL has used several field names over time; also tolerate approximate "~74".
             for key in (
                 "rankPercent",
                 "historicalPercent",
@@ -824,7 +822,6 @@ class WCLClient:
                     "amount": item.get("bestAmount", item.get("amount")),
                 })
             values = [b["percentile"] for b in bosses if b["percentile"] is not None]
-            # Newer WCL zoneRankings JSON (Midnight+) uses *PerformanceAverage keys.
             avg = (
                 rankings.get("medianPerformanceAverage")
                 or rankings.get("medianPerformance")
@@ -843,46 +840,73 @@ class WCLClient:
                 best = max(values)
             return bosses, percentile_number(avg), percentile_number(best)
 
-        char, rankings = await _fetch_rankings(use_spec_filter=True)
-        if not char:
-            return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
+        def _has_data(avg_parse, best_parse, bosses) -> bool:
+            return avg_parse is not None or best_parse is not None or any(
+                b.get("percentile") is not None for b in bosses
+            )
 
-        bosses, avg_parse, best_parse = _parse_rankings(rankings)
-        has_data = avg_parse is not None or best_parse is not None or any(
-            b.get("percentile") is not None for b in bosses
-        )
-        if not has_data:
-            # Retry without class/spec filter — common on brand-new partitions.
-            char2, rankings2 = await _fetch_rankings(use_spec_filter=False)
+        char = None
+        rankings = {}
+        bosses, avg_parse, best_parse = [], None, None
+        used = None
+
+        # 1) class+spec + role metrics
+        for metric in metrics_to_try:
+            char, rankings = await _fetch_rankings(metric=metric, use_spec_filter=True)
+            if not char:
+                return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
+            bosses, avg_parse, best_parse = _parse_rankings(rankings)
+            if _has_data(avg_parse, best_parse, bosses):
+                used = f"spec+{metric}"
+                break
+
+        # 2) no class/spec filter + same metrics
+        if not _has_data(avg_parse, best_parse, bosses):
+            for metric in metrics_to_try:
+                char2, rankings2 = await _fetch_rankings(metric=metric, use_spec_filter=False)
+                if char2:
+                    char = char2
+                    rankings = rankings2
+                    bosses, avg_parse, best_parse = _parse_rankings(rankings2)
+                    if _has_data(avg_parse, best_parse, bosses):
+                        used = f"any+{metric}"
+                        break
+
+        # 3) all partitions (partition=-1), default metric, with spec
+        if not _has_data(avg_parse, best_parse, bosses):
+            char2, rankings2 = await _fetch_rankings(metric=None, use_spec_filter=True, partition=-1)
             if char2:
                 char = char2
                 rankings = rankings2
                 bosses, avg_parse, best_parse = _parse_rankings(rankings2)
-                has_data = avg_parse is not None or best_parse is not None or any(
-                    b.get("percentile") is not None for b in bosses
-                )
+                if _has_data(avg_parse, best_parse, bosses):
+                    used = "spec+partition-1"
 
-        if not has_data:
-            # Debug: help diagnose unexpected zoneRankings shapes on new tiers.
+        if not char:
+            return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
+
+        if not _has_data(avg_parse, best_parse, bosses):
             top_keys = list(rankings.keys()) if isinstance(rankings, dict) else type(rankings).__name__
             sample = None
             raw_list = rankings.get("rankings") if isinstance(rankings, dict) else None
             if isinstance(raw_list, list) and raw_list:
-                # Prefer a row that has kills / amount so we see real fields.
                 sample = next(
                     (r for r in raw_list if isinstance(r, dict) and (r.get("totalKills") or r.get("bestAmount"))),
                     raw_list[0],
                 )
             print(
                 f"[WCL parse miss] {name}/{normalize_realm(realm)} zone={raid['zone_id']} "
-                f"diff={difficulty_id} class={wcl_class}/{wcl_spec} keys={top_keys} "
+                f"diff={difficulty_id} class={wcl_class}/{wcl_spec} role={role} keys={top_keys} "
                 f"medAvg={rankings.get('medianPerformanceAverage')!r} "
-                f"bestAvg={rankings.get('bestPerformanceAverage')!r} sample={sample!r}"
+                f"bestAvg={rankings.get('bestPerformanceAverage')!r} "
+                f"metric_field={rankings.get('metric')!r} partition={rankings.get('partition')!r} "
+                f"sample={sample!r}"
             )
         else:
             print(
-                f"[WCL parse ok] {name} avg={avg_parse} best={best_parse} "
-                f"bosses_with_parse={sum(1 for b in bosses if b.get('percentile') is not None)}"
+                f"[WCL parse ok] {name} via={used} avg={avg_parse} best={best_parse} "
+                f"bosses_with_parse={sum(1 for b in bosses if b.get('percentile') is not None)} "
+                f"metric_field={rankings.get('metric')!r}"
             )
 
         server_slug = char["server"]["slug"]
