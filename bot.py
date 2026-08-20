@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-20-full-raid-fix-v6-ephemeral-raid-create"
+CODE_VERSION = "2026-08-20-parse-tilde-fallback-v7"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -383,12 +383,25 @@ def role_for_spec(wcl_spec: str) -> str:
     return SPEC_ROLE.get(wcl_spec, "ДД")
 
 def percentile_number(value: Any) -> Optional[float]:
-    try:
+    """Parse a WCL percentile. Handles null, '-', '~74', '74%', and plain numbers."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
         n = float(value)
-        if 0 <= n <= 100:
-            return n
-    except (TypeError, ValueError):
-        pass
+        return n if 0 <= n <= 100 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text in ("-", "—", "N/A", "n/a", "null"):
+            return None
+        # Approximate ranks from low-sample bosses: "~74", "~ 74", "≈74"
+        text = text.lstrip("~≈")
+        text = text.replace("%", "").strip()
+        try:
+            n = float(text)
+            if 0 <= n <= 100:
+                return n
+        except ValueError:
+            pass
     return None
 
 def parse_color(p: Optional[float]) -> int:
@@ -715,63 +728,130 @@ class WCLClient:
     async def character(self, name: str, realm: str, region: str, raid_id: str, difficulty_id: int,
                         wcl_class: str, wcl_spec: str) -> dict:
         raid = RAIDS[raid_id]
-        q = """
-        query Character(
-          $name:String!, $server:String!, $region:String!,
-          $zone:Int!, $difficulty:Int!, $class:String!, $spec:String!
-        ) {
-          characterData {
-            character(name:$name, serverSlug:$server, serverRegion:$region) {
-              id name hidden classID level
-              server { name slug normalizedName region { name slug } }
-              zoneRankings(
-                zoneID:$zone
-                difficulty:$difficulty
-                className:$class
-                specName:$spec
-              )
-            }
-          }
-        }
-        """
-        data = await self.graphql(q, {
-            "name": name, "server": normalize_realm(realm), "region": region,
-            "zone": raid["zone_id"], "difficulty": difficulty_id,
-            "class": wcl_class, "spec": wcl_spec,
-        })
-        char = ((data.get("characterData") or {}).get("character"))
+
+        async def _fetch_rankings(use_spec_filter: bool) -> tuple:
+            if use_spec_filter:
+                q = """
+                query Character(
+                  $name:String!, $server:String!, $region:String!,
+                  $zone:Int!, $difficulty:Int!, $class:String!, $spec:String!
+                ) {
+                  characterData {
+                    character(name:$name, serverSlug:$server, serverRegion:$region) {
+                      id name hidden classID level
+                      server { name slug normalizedName region { name slug } }
+                      zoneRankings(
+                        zoneID:$zone
+                        difficulty:$difficulty
+                        className:$class
+                        specName:$spec
+                      )
+                    }
+                  }
+                }
+                """
+                variables = {
+                    "name": name, "server": normalize_realm(realm), "region": region,
+                    "zone": raid["zone_id"], "difficulty": difficulty_id,
+                    "class": wcl_class, "spec": wcl_spec,
+                }
+            else:
+                # Fallback: no class/spec filter. Early-tier WCL responses sometimes
+                # omit filtered rankings even when the character page shows numbers.
+                q = """
+                query Character(
+                  $name:String!, $server:String!, $region:String!,
+                  $zone:Int!, $difficulty:Int!
+                ) {
+                  characterData {
+                    character(name:$name, serverSlug:$server, serverRegion:$region) {
+                      id name hidden classID level
+                      server { name slug normalizedName region { name slug } }
+                      zoneRankings(
+                        zoneID:$zone
+                        difficulty:$difficulty
+                      )
+                    }
+                  }
+                }
+                """
+                variables = {
+                    "name": name, "server": normalize_realm(realm), "region": region,
+                    "zone": raid["zone_id"], "difficulty": difficulty_id,
+                }
+            data = await self.graphql(q, variables)
+            char = ((data.get("characterData") or {}).get("character"))
+            if not char:
+                return None, {}
+            rankings = char.get("zoneRankings")
+            if isinstance(rankings, str):
+                try:
+                    rankings = json.loads(rankings)
+                except json.JSONDecodeError:
+                    rankings = {}
+            return char, rankings or {}
+
+        def _item_percentile(item: dict) -> Optional[float]:
+            # WCL has used several field names over time; also tolerate approximate "~74".
+            for key in (
+                "rankPercent",
+                "historicalPercent",
+                "todayPercent",
+                "percentile",
+                "performance",
+                "medianPercent",
+            ):
+                p = percentile_number(item.get(key))
+                if p is not None:
+                    return p
+            ranks = item.get("ranks")
+            if isinstance(ranks, dict):
+                p = percentile_number(ranks.get("percentile") or ranks.get("rankPercent"))
+                if p is not None:
+                    return p
+            return None
+
+        def _parse_rankings(rankings: dict):
+            bosses = []
+            for item in rankings.get("rankings") or []:
+                if not isinstance(item, dict):
+                    continue
+                boss_name = normalize_boss_name(item.get("encounter", item.get("boss", "Босс")))
+                p = _item_percentile(item)
+                bosses.append({
+                    "boss": boss_name,
+                    "percentile": p,
+                    "amount": item.get("bestAmount", item.get("amount")),
+                })
+            values = [b["percentile"] for b in bosses if b["percentile"] is not None]
+            avg = rankings.get("medianPerformance")
+            if avg is None:
+                avg = rankings.get("averagePerformance")
+            if avg is None:
+                avg = rankings.get("bestPerformance")
+            if avg is None and values:
+                avg = sum(values) / len(values)
+            best = rankings.get("bestPerformance")
+            if best is None:
+                best = rankings.get("rankPercent")
+            if best is None and values:
+                best = max(values)
+            return bosses, percentile_number(avg), percentile_number(best)
+
+        char, rankings = await _fetch_rankings(use_spec_filter=True)
         if not char:
             return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
 
-        rankings = char.get("zoneRankings")
-        if isinstance(rankings, str):
-            try:
-                rankings = json.loads(rankings)
-            except json.JSONDecodeError:
-                rankings = {}
-        rankings = rankings or {}
-
-        bosses = []
-        raw_rankings = rankings.get("rankings") or []
-        for item in raw_rankings:
-            boss_name = normalize_boss_name(item.get("encounter", item.get("boss", "Босс")))
-            p = percentile_number(item.get("rankPercent", item.get("percentile", item.get("performance"))))
-            bosses.append({
-                "boss": boss_name,
-                "percentile": p,
-                "amount": item.get("bestAmount", item.get("amount")),
-            })
-
-        values = [b["percentile"] for b in bosses if b["percentile"] is not None]
-        avg = rankings.get("medianPerformance")
-        if avg is None:
-            avg = rankings.get("averagePerformance")
-        if avg is None and values:
-            avg = sum(values) / len(values)
-
-        best = rankings.get("rankPercent")
-        if best is None and values:
-            best = max(values)
+        bosses, avg_parse, best_parse = _parse_rankings(rankings)
+        has_data = avg_parse is not None or best_parse is not None or any(
+            b.get("percentile") is not None for b in bosses
+        )
+        if not has_data:
+            # Retry without class/spec filter — common on brand-new partitions.
+            char2, rankings2 = await _fetch_rankings(use_spec_filter=False)
+            if char2:
+                char = char2
+                bosses, avg_parse, best_parse = _parse_rankings(rankings2)
 
         server_slug = char["server"]["slug"]
         profile = f"{WCL_SITE}/character/{region}/{server_slug}/{char['name']}?zone={raid['zone_id']}"
@@ -780,8 +860,8 @@ class WCLClient:
             "character_name": char["name"],
             "server": char["server"]["name"],
             "server_slug": server_slug,
-            "avg_parse": percentile_number(avg),
-            "best_parse": percentile_number(best),
+            "avg_parse": avg_parse,
+            "best_parse": best_parse,
             "bosses": bosses,
             "profile_url": profile,
         }
@@ -1807,19 +1887,32 @@ async def parse_cmd(
         rankings = char.get("zoneRankings") or {}
         if isinstance(rankings, str):
             rankings = json.loads(rankings)
-        vals = [
-            percentile_number(x.get("rankPercent", x.get("percentile")))
-            for x in (rankings.get("rankings") or [])
-        ]
-        vals = [x for x in vals if x is not None]
-        avg = rankings.get("medianPerformance") or rankings.get("averagePerformance")
+        vals = []
+        for x in rankings.get("rankings") or []:
+            if not isinstance(x, dict):
+                continue
+            for key in ("rankPercent", "historicalPercent", "todayPercent", "percentile", "performance"):
+                p = percentile_number(x.get(key))
+                if p is not None:
+                    vals.append(p)
+                    break
+        avg = rankings.get("medianPerformance")
+        if avg is None:
+            avg = rankings.get("averagePerformance")
+        if avg is None:
+            avg = rankings.get("bestPerformance")
         if avg is None and vals:
-            avg = sum(vals)/len(vals)
+            avg = sum(vals) / len(vals)
+        avg_num = percentile_number(avg)
         embed = discord.Embed(
             title=f"📊 {char['name']} · {info['name']}",
-            color=parse_color(percentile_number(avg))
+            color=parse_color(avg_num)
         )
-        embed.add_field(name="Средний лог", value=f"**{float(avg):.0f}**" if avg is not None else "—", inline=True)
+        embed.add_field(
+            name="Средний лог",
+            value=f"**{avg_num:.0f}**" if avg_num is not None else "—",
+            inline=True,
+        )
         embed.add_field(name="Рейд", value=difficulty.name, inline=True)
         embed.add_field(name="Реалм", value=char["server"]["name"], inline=True)
         if rankings.get("allStars"):
