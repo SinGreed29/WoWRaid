@@ -17,6 +17,8 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
+CODE_VERSION = "2026-08-20-zone53-live-v13"
+
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
 # .env is optional and must NOT be committed to GitHub.
@@ -32,16 +34,18 @@ WCL_SITE = os.getenv("WCL_SITE", "https://www.warcraftlogs.com").rstrip("/")
 WCL_API = os.getenv("WCL_API", f"{WCL_SITE}/api/v2/client").rstrip("/")
 WCL_REGION = os.getenv("WCL_REGION", "eu").strip().lower()
 WCL_DEFAULT_REALM = os.getenv("WCL_DEFAULT_REALM", "howling-fjord").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "raids.sqlite3")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/raids.sqlite3")
 REFRESH_MINUTES = max(5, int(os.getenv("REFRESH_MINUTES", "15")))
-RAID_LIMIT = max(1, min(40, int(os.getenv("RAID_LIMIT", "30"))))
+RAID_LIMIT = 30  # 6 групп по 5 человек
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
 if not DISCORD_TOKEN:
     raise SystemExit("DISCORD_TOKEN не задан. Добавьте DISCORD_TOKEN в переменные окружения Railway или в локальный .env.")
 if not WCL_CLIENT_ID or not WCL_CLIENT_SECRET:
     raise SystemExit("WCL_CLIENT_ID/WCL_CLIENT_SECRET не заданы. Добавьте их в переменные окружения Railway или в локальный .env.")
+print(f"[CONFIG] CODE_VERSION: {CODE_VERSION}")
 print(f"[CONFIG] bot.py: {Path(__file__).resolve()}")
+print(f"[CONFIG] DATABASE_PATH: {DATABASE_PATH}")
 print(f"[CONFIG] .env найден: {ENV_FILE.exists()} (на Railway не требуется)")
 print(f"[CONFIG] Discord token: {'OK' if DISCORD_TOKEN else 'НЕ НАЙДЕН'}")
 print(f"[CONFIG] WCL Client ID: {'OK' if WCL_CLIENT_ID else 'НЕ НАЙДЕН'}")
@@ -85,9 +89,11 @@ RAIDS = {
     "venomous_abyss": {
         "name": "Ядовитая Бездна",
         "name_en": "The Venomous Abyss",
-        "zone_id": 54,
+        # Live WCL zone is 53 (character pages use ?zone=53).
+        # Zone 54 is the PTR rankings bucket and returns empty live parses.
+        "zone_id": 53,
         "bosses": 8,
-        "url": "https://www.warcraftlogs.com/zone/rankings/54",
+        "url": "https://www.warcraftlogs.com/zone/rankings/53",
         "wowhead_url": "https://www.wowhead.com/guide/midnight/raids/the-venomous-abyss-overview-location-rewards-bosses",
     },
 }
@@ -217,7 +223,6 @@ SPEC_ROLE = {
 
 STATUS_LABELS = {
     "confirmed": ("Записан", "👥"),
-    "unsure": ("Не уверен", "⚖️"),
     "late": ("Опоздаю", "🕐"),
     "cant": ("Не смогу", "❌"),
 }
@@ -380,12 +385,25 @@ def role_for_spec(wcl_spec: str) -> str:
     return SPEC_ROLE.get(wcl_spec, "ДД")
 
 def percentile_number(value: Any) -> Optional[float]:
-    try:
+    """Parse a WCL percentile. Handles null, '-', '~74', '74%', and plain numbers."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
         n = float(value)
-        if 0 <= n <= 100:
-            return n
-    except (TypeError, ValueError):
-        pass
+        return n if 0 <= n <= 100 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text in ("-", "—", "N/A", "n/a", "null"):
+            return None
+        # Approximate ranks from low-sample bosses: "~74", "~ 74", "≈74"
+        text = text.lstrip("~≈")
+        text = text.replace("%", "").strip()
+        try:
+            n = float(text)
+            if 0 <= n <= 100:
+                return n
+        except ValueError:
+            pass
     return None
 
 def parse_color(p: Optional[float]) -> int:
@@ -499,7 +517,7 @@ class DB:
         self.conn.execute("""
         INSERT INTO raids
         (channel_id,guild_id,name,date_text,raid_id,difficulty_name,difficulty_id,leader_id,leader_name,message_id,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
             data["channel_id"], data["guild_id"], data["name"], data["date_text"],
             data["raid_id"], data["difficulty_name"], data["difficulty_id"],
@@ -711,137 +729,246 @@ class WCLClient:
 
     async def character(self, name: str, realm: str, region: str, raid_id: str, difficulty_id: int,
                         wcl_class: str, wcl_spec: str) -> dict:
-        """Fetch character rankings with a compatibility fallback for WCL zone IDs.
-
-        The current Venomous Abyss rankings page uses zone 54, while character
-        profile/history links can still expose the same raid under zone 53.
-        We therefore try the raid's configured zone first and, for Venomous
-        Abyss only, fall back to zone 53 when no rankings are returned.
-
-        Class/spec filters are deliberately omitted here. WCL can have slightly
-        different historical spec labels, and filtering at the API level can
-        make an existing character parse disappear. The character itself is
-        already known, so we safely collect its rankings and let the UI display
-        the stored class/spec.
-        """
         raid = RAIDS[raid_id]
+        role = role_for_spec(wcl_spec)
+        # Try role-appropriate metrics first, then a couple of fallbacks.
+        # Website "Урон" view uses dps even for some tanks; tankhps/hps for tanks/heals.
+        if role == "Танк":
+            metrics_to_try = ["dps", "tankhps", "hps"]
+        elif role == "Хил":
+            metrics_to_try = ["hps", "dps"]
+        else:
+            metrics_to_try = ["dps", "hps"]
 
-        zone_candidates = [raid["zone_id"]]
-        if raid_id == "venomous_abyss" and 53 not in zone_candidates:
-            zone_candidates.append(53)
-
-        q = """
-        query Character(
-          $name:String!, $server:String!, $region:String!,
-          $zone:Int!, $difficulty:Int!
-        ) {
-          characterData {
-            character(name:$name, serverSlug:$server, serverRegion:$region) {
-              id name hidden classID level
-              server { name slug normalizedName region { name slug } }
-              zoneRankings(
-                zoneID:$zone
-                difficulty:$difficulty
-              )
+        async def _fetch_rankings(
+            metric: Optional[str] = None,
+            use_spec_filter: bool = True,
+            partition: Optional[int] = None,
+            timeframe: Optional[str] = None,
+            include_difficulty: bool = True,
+        ) -> tuple:
+            # Character pages on WCL default to Historical rankings; API default
+            # is often closer to Today — empty on brand-new tiers.
+            parts = ["zoneID: $zone"]
+            var_decls = [
+                "$name:String!", "$server:String!", "$region:String!",
+                "$zone:Int!",
+            ]
+            variables = {
+                "name": name, "server": normalize_realm(realm), "region": region,
+                "zone": raid["zone_id"],
             }
-          }
-        }
-        """
+            if include_difficulty:
+                var_decls.append("$difficulty:Int!")
+                variables["difficulty"] = difficulty_id
+                parts.append("difficulty: $difficulty")
+            if use_spec_filter:
+                var_decls.extend(["$class:String!", "$spec:String!"])
+                variables["class"] = wcl_class
+                variables["spec"] = wcl_spec
+                parts.append("className: $class")
+                parts.append("specName: $spec")
+            if metric:
+                var_decls.append("$metric:CharacterPageRankingMetricType")
+                variables["metric"] = metric
+                parts.append("metric: $metric")
+            if partition is not None:
+                var_decls.append("$partition:Int")
+                variables["partition"] = partition
+                parts.append("partition: $partition")
+            if timeframe:
+                var_decls.append("$timeframe:RankingTimeframeType")
+                variables["timeframe"] = timeframe
+                parts.append("timeframe: $timeframe")
 
-        char = None
-        rankings = {}
-        used_zone = raid["zone_id"]
-        last_error = None
-
-        for zone_id in zone_candidates:
-            try:
-                data = await self.graphql(q, {
-                    "name": name,
-                    "server": normalize_realm(realm),
-                    "region": region,
-                    "zone": zone_id,
-                    "difficulty": difficulty_id,
-                })
-            except Exception as e:
-                last_error = str(e)
-                continue
-
+            parts_block = "\n                    ".join(parts)
+            q = f"""
+            query Character({', '.join(var_decls)}) {{
+              characterData {{
+                character(name:$name, serverSlug:$server, serverRegion:$region) {{
+                  id name hidden classID level
+                  server {{ name slug normalizedName region {{ name slug }} }}
+                  zoneRankings(
+                    {parts_block}
+                  )
+                }}
+              }}
+            }}
+            """
+            data = await self.graphql(q, variables)
             char = ((data.get("characterData") or {}).get("character"))
             if not char:
-                return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
-
-            raw = char.get("zoneRankings")
-            if isinstance(raw, str):
+                return None, {}
+            rankings = char.get("zoneRankings")
+            if isinstance(rankings, str):
                 try:
-                    raw = json.loads(raw)
+                    rankings = json.loads(rankings)
                 except json.JSONDecodeError:
-                    raw = {}
-            rankings = raw or {}
+                    rankings = {}
+            return char, rankings or {}
 
-            raw_rankings = rankings.get("rankings") or []
-            all_stars = rankings.get("allStars") or []
-            if raw_rankings or all_stars or rankings.get("rankPercent") is not None:
-                used_zone = zone_id
-                break
+        def _item_percentile(item: dict) -> Optional[float]:
+            for key in (
+                "rankPercent",
+                "historicalPercent",
+                "todayPercent",
+                "percentile",
+                "performance",
+                "medianPercent",
+            ):
+                p = percentile_number(item.get(key))
+                if p is not None:
+                    return p
+            ranks = item.get("ranks")
+            if isinstance(ranks, dict):
+                p = percentile_number(ranks.get("percentile") or ranks.get("rankPercent"))
+                if p is not None:
+                    return p
+            return None
 
-            # For Venomous Abyss, an empty zone 54 result is retried against
-            # the legacy/profile zone 53. For every other raid we stop here.
-            used_zone = zone_id
-
-        if not char:
-            return {"found": False, "error": last_error or "Не удалось получить персонажа из Warcraft Logs."}
-
-        bosses = []
-        raw_rankings = rankings.get("rankings") or []
-        for item in raw_rankings:
-            boss_name = normalize_boss_name(item.get("encounter", item.get("boss", "Босс")))
-            p = percentile_number(item.get("rankPercent", item.get("percentile", item.get("performance"))))
-            bosses.append({
-                "boss": boss_name,
-                "percentile": p,
-                "amount": item.get("bestAmount", item.get("amount")),
-            })
-
-        # Some WCL responses expose All Stars separately. Keep it as a
-        # fallback so a character with All Stars but no normal ranking list
-        # is not treated as having no logs.
-        if not bosses:
-            for item in (rankings.get("allStars") or []):
-                boss_name = normalize_boss_name(item.get("encounter", item.get("boss", "Все боссы")))
-                p = percentile_number(item.get("rankPercent", item.get("percentile", item.get("performance"))))
+        def _parse_rankings(rankings: dict):
+            bosses = []
+            for item in rankings.get("rankings") or []:
+                if not isinstance(item, dict):
+                    continue
+                boss_name = normalize_boss_name(item.get("encounter", item.get("boss", "Босс")))
+                p = _item_percentile(item)
                 bosses.append({
                     "boss": boss_name,
                     "percentile": p,
                     "amount": item.get("bestAmount", item.get("amount")),
                 })
+            values = [b["percentile"] for b in bosses if b["percentile"] is not None]
+            avg = (
+                rankings.get("medianPerformanceAverage")
+                or rankings.get("medianPerformance")
+                or rankings.get("averagePerformance")
+                or rankings.get("bestPerformanceAverage")
+                or rankings.get("bestPerformance")
+            )
+            if avg is None and values:
+                avg = sum(values) / len(values)
+            best = (
+                rankings.get("bestPerformanceAverage")
+                or rankings.get("bestPerformance")
+                or rankings.get("rankPercent")
+            )
+            if best is None and values:
+                best = max(values)
+            return bosses, percentile_number(avg), percentile_number(best)
 
-        values = [b["percentile"] for b in bosses if b["percentile"] is not None]
-        avg = rankings.get("medianPerformance")
-        if avg is None:
-            avg = rankings.get("averagePerformance")
-        if avg is None and values:
-            avg = sum(values) / len(values)
+        def _has_data(avg_parse, best_parse, bosses) -> bool:
+            return avg_parse is not None or best_parse is not None or any(
+                b.get("percentile") is not None for b in bosses
+            )
 
-        best = rankings.get("rankPercent")
-        if best is None and values:
-            best = max(values)
+        char = None
+        rankings = {}
+        bosses, avg_parse, best_parse = [], None, None
+        used = None
+
+        # Attempt order mirrors what the WCL character page uses:
+        # Historical timeframe + role metric + class/spec, then broaden.
+        attempts = []
+        for tf in ("Historical", None):
+            for metric in metrics_to_try:
+                attempts.append({"metric": metric, "use_spec_filter": True, "timeframe": tf, "label": f"spec+{metric}+{tf or 'defaultTF'}"})
+            for metric in metrics_to_try:
+                attempts.append({"metric": metric, "use_spec_filter": False, "timeframe": tf, "label": f"any+{metric}+{tf or 'defaultTF'}"})
+        attempts.append({"metric": metrics_to_try[0], "use_spec_filter": True, "timeframe": "Historical", "partition": -1, "label": "spec+Historical+partition-1"})
+        attempts.append({"metric": metrics_to_try[0], "use_spec_filter": True, "timeframe": "Historical", "include_difficulty": False, "label": "spec+Historical+noDiff"})
+
+        # Discover zone partitions and try each one (PTR vs live can differ).
+        partition_ids = []
+        try:
+            zone_info = await self.zone(raid["zone_id"])
+            for p in zone_info.get("partitions") or []:
+                if isinstance(p, dict) and p.get("id") is not None:
+                    partition_ids.append(int(p["id"]))
+            print(
+                f"[WCL partitions] zone={raid['zone_id']} "
+                f"{[(p.get('id'), p.get('name'), p.get('default')) for p in (zone_info.get('partitions') or [])]}"
+            )
+        except Exception as e:
+            print(f"[WCL partitions] zone={raid['zone_id']} error: {e}")
+        for pid in partition_ids:
+            attempts.append({
+                "metric": metrics_to_try[0],
+                "use_spec_filter": True,
+                "timeframe": "Historical",
+                "partition": pid,
+                "label": f"spec+Historical+partition{pid}",
+            })
+
+        for attempt in attempts:
+            label = attempt.pop("label")
+            try:
+                char2, rankings2 = await _fetch_rankings(**attempt)
+            except Exception as e:
+                print(f"[WCL attempt fail] {label}: {e}")
+                continue
+            if not char2:
+                if char is None:
+                    return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
+                continue
+            char = char2
+            rankings = rankings2
+            bosses, avg_parse, best_parse = _parse_rankings(rankings2)
+            if _has_data(avg_parse, best_parse, bosses):
+                used = label
+                break
+
+        if not char:
+            return {"found": False, "error": "Персонаж не найден в Warcraft Logs."}
+
+        if not _has_data(avg_parse, best_parse, bosses):
+            top_keys = list(rankings.keys()) if isinstance(rankings, dict) else type(rankings).__name__
+            sample = None
+            raw_list = rankings.get("rankings") if isinstance(rankings, dict) else None
+            if isinstance(raw_list, list) and raw_list:
+                sample = next(
+                    (r for r in raw_list if isinstance(r, dict) and (r.get("totalKills") or r.get("bestAmount"))),
+                    raw_list[0],
+                )
+            # Dump compact summary of all ranking rows (kills / rankPercent only).
+            rows_summary = []
+            if isinstance(raw_list, list):
+                for r in raw_list[:12]:
+                    if not isinstance(r, dict):
+                        continue
+                    enc = r.get("encounter") or {}
+                    rows_summary.append({
+                        "boss": enc.get("name") if isinstance(enc, dict) else enc,
+                        "kills": r.get("totalKills"),
+                        "rank": r.get("rankPercent"),
+                        "med": r.get("medianPercent"),
+                        "amt": r.get("bestAmount"),
+                    })
+            print(
+                f"[WCL parse miss] {name}/{normalize_realm(realm)} zone={raid['zone_id']} "
+                f"diff={difficulty_id} class={wcl_class}/{wcl_spec} role={role} "
+                f"hidden={char.get('hidden')!r} keys={top_keys} "
+                f"medAvg={rankings.get('medianPerformanceAverage')!r} "
+                f"bestAvg={rankings.get('bestPerformanceAverage')!r} "
+                f"metric_field={rankings.get('metric')!r} partition={rankings.get('partition')!r} "
+                f"rows={rows_summary!r}"
+            )
+        else:
+            print(
+                f"[WCL parse ok] {name} via={used} avg={avg_parse} best={best_parse} "
+                f"bosses_with_parse={sum(1 for b in bosses if b.get('percentile') is not None)} "
+                f"metric_field={rankings.get('metric')!r}"
+            )
 
         server_slug = char["server"]["slug"]
-        profile = f"{WCL_SITE}/character/{region}/{server_slug}/{char['name']}?zone={used_zone}"
-
-        print(
-            f"[WCL character] {char.get('name')} / {char.get('server', {}).get('name')} "
-            f"raid={raid_id} difficulty={difficulty_id} zone={used_zone} "
-            f"rankings={len(raw_rankings)} allStars={len(rankings.get('allStars') or [])}"
-        )
-
+        profile = f"{WCL_SITE}/character/{region}/{server_slug}/{char['name']}?zone={raid['zone_id']}"
         return {
             "found": True,
             "character_name": char["name"],
             "server": char["server"]["name"],
             "server_slug": server_slug,
-            "avg_parse": percentile_number(avg),
-            "best_parse": percentile_number(best),
+            "avg_parse": avg_parse,
+            "best_parse": best_parse,
             "bosses": bosses,
             "profile_url": profile,
         }
@@ -875,6 +1002,7 @@ class WCLClient:
               id name
               encounters { id name }
               difficulties { id name sizes }
+              partitions { id name compactName default }
             }
           }
         }
@@ -890,13 +1018,34 @@ class WCLClient:
         if not code:
             raise ValueError("Не нашёл код отчёта в ссылке Warcraft Logs.")
         report = await self.report(code)
-        expected_zone = RAIDS[raid_id]["zone_id"]
-        if not report.get("zone") or report["zone"]["id"] != expected_zone:
+        expected_zone = int(RAIDS[raid_id]["zone_id"])
+        report_zone = report.get("zone") or {}
+        report_zone_id_raw = report_zone.get("id")
+        try:
+            report_zone_id = int(report_zone_id_raw)
+        except (TypeError, ValueError):
+            report_zone_id = None
+
+        # Warcraft Logs can return the zone ID through GraphQL as either an
+        # integer or a string depending on the API response/schema version.
+        # Normalize it before comparing so a valid log is not rejected with
+        # a false "zone mismatch" error (e.g. "54" != 54 in Python).
+        zone_id_matches = report_zone_id == expected_zone
+
+        # As an additional safeguard, accept an exact zone-name match. This
+        # is useful for reports created during WCL's zone/tier transitions.
+        expected_zone_name = RAIDS[raid_id]["name_en"].strip().casefold()
+        report_zone_name = str(report_zone.get("name") or "").strip().casefold()
+        zone_name_matches = report_zone_name == expected_zone_name
+
+        if not report_zone or not (zone_id_matches or zone_name_matches):
             raise RuntimeError(
-                f"Этот лог относится к зоне {report.get('zone', {}).get('name', 'неизвестно')}, "
-                f"а выбранный рейд относится к зоне {expected_zone}."
+                f"Этот лог относится к зоне {report_zone.get('name', 'неизвестно')} "
+                f"(ID {report_zone_id_raw}), а выбранный рейд относится к зоне "
+                f"{RAIDS[raid_id]['name_en']} (ID {expected_zone})."
             )
-        valid_encounters = {e["id"]: e["name"] for e in (report["zone"].get("encounters") or [])}
+
+        valid_encounters = {e["id"]: e["name"] for e in (report_zone.get("encounters") or [])}
         kills = []
         for fight in report.get("fights") or []:
             if not fight.get("kill"):
@@ -912,7 +1061,7 @@ class WCLClient:
         return {
             "code": code,
             "title": report["title"],
-            "zone": report["zone"]["name"],
+            "zone": report_zone["name"],
             "kills": list(unique.values()),
             "total": len(unique),
             "url": f"https://www.warcraftlogs.com/reports/{code}",
@@ -922,6 +1071,7 @@ def extract_report_code(url: str) -> Optional[str]:
     m = re.search(r"/reports/([A-Za-z0-9]+)", url.strip())
     return m.group(1) if m else None
 
+Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
 db = DB(DATABASE_PATH)
 wcl = WCLClient()
 
@@ -1076,7 +1226,10 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
     )
 
 
-    # Six groups, five players each. Force two groups per row with a blank inline field.
+    # Exactly six groups, maximum five players in each.
+    # Layout: Group 1 | Group 2
+    #         Group 3 | Group 4
+    #         Group 5 | Group 6
     group_fields = {}
     for group_no in range(1, 7):
         group = [p for p in confirmed if int(p.get("group_no") or 1) == group_no]
@@ -1223,20 +1376,41 @@ class RaidCreateView(discord.ui.View):
         super().__init__(timeout=180)
         self.add_item(RaidSelect())
 
+# Русскоязычные реалмы EU. В Discord показываем русское название,
+# а в Warcraft Logs передаём стабильный английский slug.
+RU_REALMS = [
+    ("Азурегос", "azuregos"),
+    ("Вечная Песня", "eversong"),
+    ("Голдринн", "goldrinn"),
+    ("Гордунни", "gordunni"),
+    ("Гром", "grom"),
+    ("Король-лич", "lich-king"),
+    ("Пиратская бухта", "booty-bay"),
+    ("Свежеватель Душ", "soulflayer"),
+    ("Страж Смерти", "deathguard"),
+    ("Термоштепсель", "thermaplugg"),
+    ("Черный Шрам", "blackscar"),
+    ("Ясеневый лес", "ashenvale"),
+    ("Борейская тундра", "borean-tundra"),
+    ("Галакронд", "galakrond"),
+    ("Дракономор", "fordragon"),
+    ("Подземье", "deepholm"),
+    ("Разувий", "razuvious"),
+    ("Ревущий фьорд", "howling-fjord"),
+    ("Седогрив", "greymane"),
+    ("Ткач Смерти", "deathweaver"),
+]
+
+
 class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
     character_name = discord.ui.TextInput(label="Имя персонажа", placeholder="Имя персонажа", max_length=30)
-    realm = discord.ui.TextInput(
-        label="Реалм",
-        placeholder="howling-fjord или Ревущий фьорд",
-        default=WCL_DEFAULT_REALM,
-        max_length=40
-    )
 
-    def __init__(self, channel_id: int, class_name: str, spec_name: str, replace_existing: bool = False):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, realm: str, replace_existing: bool = False):
         super().__init__()
         self.channel_id = channel_id
         self.class_name = class_name
         self.spec_name = spec_name
+        self.realm = realm
         self.replace_existing = replace_existing
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -1257,7 +1431,7 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
         try:
             result = await wcl.character(
                 self.character_name.value.strip(),
-                self.realm.value.strip(),
+                self.realm,
                 WCL_REGION,
                 raid["raid_id"],
                 raid["difficulty_id"],
@@ -1306,11 +1480,14 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
         await refresh_raid_message(channel, self.channel_id)
 
         p = result.get("avg_parse")
+        action = "обновлён" if old else "записан"
         text = (
-            f"✅ **{result['character_name']}** записан.\n"
+            f"✅ **{result['character_name']}** {action}.\n"
             f"{cd['emoji']} {self.class_name} · {self.spec_name}\n"
             f"📈 Средний лог: **{p:.0f}**" if p is not None else
-            f"✅ **{result['character_name']}** {action_text}.\n{cd['emoji']} {self.class_name} · {self.spec_name}\n📈 Лог: `—`"
+            f"✅ **{result['character_name']}** {action}.\n"
+            f"{cd['emoji']} {self.class_name} · {self.spec_name}\n"
+            f"📈 Лог: `—`"
         )
         await interaction.followup.send(text, ephemeral=True)
 
@@ -1354,10 +1531,88 @@ class SpecSelect(discord.ui.Select):
         super().__init__(placeholder="Выберите специализацию", options=options, custom_id="spec_select")
 
     async def callback(self, interaction: discord.Interaction):
-        # Important: a modal must be sent as the interaction response itself.
-        await interaction.response.send_modal(
-            CharacterModal(self.channel_id, self.class_name, self.values[0], self.replace_existing)
+        await interaction.response.edit_message(
+            content=f"Выбран класс **{self.class_name}**, специализация **{self.values[0]}**. Выберите сервер:",
+            view=RealmSelectView(
+                self.channel_id,
+                self.class_name,
+                self.values[0],
+                self.guild_id,
+                self.replace_existing,
+            )
         )
+
+
+class RealmSelect(discord.ui.Select):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, guild_id: Optional[int] = None, replace_existing: bool = False):
+        self.channel_id = channel_id
+        self.class_name = class_name
+        self.spec_name = spec_name
+        self.guild_id = guild_id
+        self.replace_existing = replace_existing
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=slug,
+                description=f"{name} — EU",
+                emoji="🌍",
+            )
+            for name, slug in RU_REALMS
+        ]
+        super().__init__(placeholder="Выберите сервер", options=options, custom_id="realm_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        # Immediately ask for the character name after the realm is selected.
+        try:
+            await interaction.response.send_modal(
+                CharacterModal(
+                    self.channel_id,
+                    self.class_name,
+                    self.spec_name,
+                    self.values[0],
+                    self.replace_existing,
+                )
+            )
+        except Exception as e:
+            print(f"[UI] Failed to open character-name modal: {type(e).__name__}: {e}")
+            view = CharacterNameFallbackView(
+                self.channel_id, self.class_name, self.spec_name, self.values[0], self.replace_existing
+            )
+            message = "Сервер выбран. Нажмите **Ввести имя персонажа**, чтобы указать ник персонажа."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, view=view, ephemeral=True)
+
+
+class CharacterNameFallbackButton(discord.ui.Button):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, realm: str, replace_existing: bool):
+        super().__init__(label="Ввести имя персонажа", style=discord.ButtonStyle.primary, emoji="✏️")
+        self.channel_id = channel_id
+        self.class_name = class_name
+        self.spec_name = spec_name
+        self.realm = realm
+        self.replace_existing = replace_existing
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            CharacterModal(
+                self.channel_id, self.class_name, self.spec_name, self.realm, self.replace_existing
+            )
+        )
+
+
+class CharacterNameFallbackView(discord.ui.View):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, realm: str, replace_existing: bool):
+        super().__init__(timeout=180)
+        self.add_item(CharacterNameFallbackButton(channel_id, class_name, spec_name, realm, replace_existing))
+
+
+class RealmSelectView(discord.ui.View):
+    def __init__(self, channel_id: int, class_name: str, spec_name: str, guild_id: Optional[int] = None, replace_existing: bool = False):
+        super().__init__(timeout=180)
+        self.add_item(RealmSelect(channel_id, class_name, spec_name, guild_id, replace_existing))
+
 
 class ClassSelectView(discord.ui.View):
     def __init__(self, channel_id: int, guild_id: Optional[int] = None, replace_existing: bool = False):
@@ -1412,10 +1667,7 @@ class StatusButton(discord.ui.Button):
                 "Сначала нажми **Запись** и добавь персонажа.", ephemeral=True
             )
             return
-        if self.status == "cant":
-            db.set_status(interaction.channel_id, interaction.user.id, "cant")
-        else:
-            db.set_status(interaction.channel_id, interaction.user.id, self.status)
+        db.set_status(interaction.channel_id, interaction.user.id, self.status)
         await refresh_raid_message(interaction.channel, interaction.channel_id)
         await interaction.response.send_message(
             f"Статус изменён: {STATUS_LABELS[self.status][1]} **{STATUS_LABELS[self.status][0]}**",
@@ -1549,19 +1801,13 @@ class GroupManageButton(discord.ui.Button):
             ephemeral=True,
         )
 
-class WebButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="Web", style=discord.ButtonStyle.link, emoji="🌐", url=WCL_SITE)
-
 class RaidView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(JoinButton())
         self.add_item(CancelButton())
-        self.add_item(StatusButton("unsure", "Не уверен", "⚖️"))
         self.add_item(StatusButton("late", "Опоздаю", "🕐"))
         self.add_item(GroupManageButton())
-        self.add_item(WebButton())
 
 class AddLogModal(discord.ui.Modal, title="Добавить Warcraft Logs"):
     url = discord.ui.TextInput(
@@ -1631,7 +1877,7 @@ async def raid_create(interaction: discord.Interaction):
     if db.get_raid(interaction.channel_id):
         await interaction.response.send_message("⚠️ В этом канале уже есть активный рейд.", ephemeral=True)
         return
-    await interaction.response.send_message("🏛️ **Выберите рейд:**", view=RaidCreateView())
+    await interaction.response.send_message("🏛️ **Выберите рейд:**", view=RaidCreateView(), ephemeral=True)
 
 @bot.tree.command(name="raid_close", description="Закрыть набор")
 async def raid_close(interaction: discord.Interaction):
@@ -1749,19 +1995,34 @@ async def parse_cmd(
         rankings = char.get("zoneRankings") or {}
         if isinstance(rankings, str):
             rankings = json.loads(rankings)
-        vals = [
-            percentile_number(x.get("rankPercent", x.get("percentile")))
-            for x in (rankings.get("rankings") or [])
-        ]
-        vals = [x for x in vals if x is not None]
-        avg = rankings.get("medianPerformance") or rankings.get("averagePerformance")
+        vals = []
+        for x in rankings.get("rankings") or []:
+            if not isinstance(x, dict):
+                continue
+            for key in ("rankPercent", "historicalPercent", "todayPercent", "percentile", "performance"):
+                p = percentile_number(x.get(key))
+                if p is not None:
+                    vals.append(p)
+                    break
+        avg = (
+            rankings.get("medianPerformanceAverage")
+            or rankings.get("medianPerformance")
+            or rankings.get("averagePerformance")
+            or rankings.get("bestPerformanceAverage")
+            or rankings.get("bestPerformance")
+        )
         if avg is None and vals:
-            avg = sum(vals)/len(vals)
+            avg = sum(vals) / len(vals)
+        avg_num = percentile_number(avg)
         embed = discord.Embed(
             title=f"📊 {char['name']} · {info['name']}",
-            color=parse_color(percentile_number(avg))
+            color=parse_color(avg_num)
         )
-        embed.add_field(name="Средний лог", value=f"**{float(avg):.0f}**" if avg is not None else "—", inline=True)
+        embed.add_field(
+            name="Средний лог",
+            value=f"**{avg_num:.0f}**" if avg_num is not None else "—",
+            inline=True,
+        )
         embed.add_field(name="Рейд", value=difficulty.name, inline=True)
         embed.add_field(name="Реалм", value=char["server"]["name"], inline=True)
         if rankings.get("allStars"):
