@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-20-parse-debug-v8"
+CODE_VERSION = "2026-08-20-medianPerformanceAverage-v9"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -824,16 +824,21 @@ class WCLClient:
                     "amount": item.get("bestAmount", item.get("amount")),
                 })
             values = [b["percentile"] for b in bosses if b["percentile"] is not None]
-            avg = rankings.get("medianPerformance")
-            if avg is None:
-                avg = rankings.get("averagePerformance")
-            if avg is None:
-                avg = rankings.get("bestPerformance")
+            # Newer WCL zoneRankings JSON (Midnight+) uses *PerformanceAverage keys.
+            avg = (
+                rankings.get("medianPerformanceAverage")
+                or rankings.get("medianPerformance")
+                or rankings.get("averagePerformance")
+                or rankings.get("bestPerformanceAverage")
+                or rankings.get("bestPerformance")
+            )
             if avg is None and values:
                 avg = sum(values) / len(values)
-            best = rankings.get("bestPerformance")
-            if best is None:
-                best = rankings.get("rankPercent")
+            best = (
+                rankings.get("bestPerformanceAverage")
+                or rankings.get("bestPerformance")
+                or rankings.get("rankPercent")
+            )
             if best is None and values:
                 best = max(values)
             return bosses, percentile_number(avg), percentile_number(best)
@@ -863,10 +868,21 @@ class WCLClient:
             sample = None
             raw_list = rankings.get("rankings") if isinstance(rankings, dict) else None
             if isinstance(raw_list, list) and raw_list:
-                sample = raw_list[0]
+                # Prefer a row that has kills / amount so we see real fields.
+                sample = next(
+                    (r for r in raw_list if isinstance(r, dict) and (r.get("totalKills") or r.get("bestAmount"))),
+                    raw_list[0],
+                )
             print(
                 f"[WCL parse miss] {name}/{normalize_realm(realm)} zone={raid['zone_id']} "
-                f"diff={difficulty_id} class={wcl_class}/{wcl_spec} keys={top_keys} sample={sample!r}"
+                f"diff={difficulty_id} class={wcl_class}/{wcl_spec} keys={top_keys} "
+                f"medAvg={rankings.get('medianPerformanceAverage')!r} "
+                f"bestAvg={rankings.get('bestPerformanceAverage')!r} sample={sample!r}"
+            )
+        else:
+            print(
+                f"[WCL parse ok] {name} avg={avg_parse} best={best_parse} "
+                f"bosses_with_parse={sum(1 for b in bosses if b.get('percentile') is not None)}"
             )
 
         server_slug = char["server"]["slug"]
@@ -1912,11 +1928,13 @@ async def parse_cmd(
                 if p is not None:
                     vals.append(p)
                     break
-        avg = rankings.get("medianPerformance")
-        if avg is None:
-            avg = rankings.get("averagePerformance")
-        if avg is None:
-            avg = rankings.get("bestPerformance")
+        avg = (
+            rankings.get("medianPerformanceAverage")
+            or rankings.get("medianPerformance")
+            or rankings.get("averagePerformance")
+            or rankings.get("bestPerformanceAverage")
+            or rankings.get("bestPerformance")
+        )
         if avg is None and vals:
             avg = sum(vals) / len(vals)
         avg_num = percentile_number(avg)
