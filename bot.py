@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-20-parse-tilde-fallback-v7"
+CODE_VERSION = "2026-08-20-parse-debug-v8"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -851,7 +851,23 @@ class WCLClient:
             char2, rankings2 = await _fetch_rankings(use_spec_filter=False)
             if char2:
                 char = char2
+                rankings = rankings2
                 bosses, avg_parse, best_parse = _parse_rankings(rankings2)
+                has_data = avg_parse is not None or best_parse is not None or any(
+                    b.get("percentile") is not None for b in bosses
+                )
+
+        if not has_data:
+            # Debug: help diagnose unexpected zoneRankings shapes on new tiers.
+            top_keys = list(rankings.keys()) if isinstance(rankings, dict) else type(rankings).__name__
+            sample = None
+            raw_list = rankings.get("rankings") if isinstance(rankings, dict) else None
+            if isinstance(raw_list, list) and raw_list:
+                sample = raw_list[0]
+            print(
+                f"[WCL parse miss] {name}/{normalize_realm(realm)} zone={raid['zone_id']} "
+                f"diff={difficulty_id} class={wcl_class}/{wcl_spec} keys={top_keys} sample={sample!r}"
+            )
 
         server_slug = char["server"]["slug"]
         profile = f"{WCL_SITE}/character/{region}/{server_slug}/{char['name']}?zone={raid['zone_id']}"
