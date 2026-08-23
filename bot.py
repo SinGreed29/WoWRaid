@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-20-zone53-live-v13"
+CODE_VERSION = "2026-08-24-realms-other-v16"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -367,16 +367,40 @@ async def load_raid_images():
             print(f"[Wowhead image] {raid_id}: not found")
 
 REALM_ALIASES = {
-    "ревущий фьорд": "howling-fjord",
-    "ревущий-фьорд": "howling-fjord",
-    "ревущий фьорд": "howling-fjord",
-    "howling fjord": "howling-fjord",
-    "howling-fjord": "howling-fjord",
+    "азурегос": "azuregos", "azuregos": "azuregos",
+    "вечная песня": "eversong", "вечная-песня": "eversong", "eversong": "eversong",
+    "голдринн": "goldrinn", "goldrinn": "goldrinn",
+    "гордунни": "gordunni", "gordunni": "gordunni",
+    "гром": "grom", "grom": "grom",
+    "король-лич": "lich-king", "король лич": "lich-king", "lich king": "lich-king", "lich-king": "lich-king",
+    "пиратская бухта": "booty-bay", "пиратская-бухта": "booty-bay", "booty bay": "booty-bay", "booty-bay": "booty-bay",
+    "свежеватель душ": "soulflayer", "свежеватель-душ": "soulflayer", "soulflayer": "soulflayer",
+    "страж смерти": "deathguard", "страж-смерти": "deathguard", "deathguard": "deathguard",
+    "термоштепсель": "thermaplugg", "thermaplugg": "thermaplugg",
+    "черный шрам": "blackscar", "чёрный шрам": "blackscar", "черный-шрам": "blackscar", "blackscar": "blackscar",
+    "ясеневый лес": "ashenvale", "ясеневый-лес": "ashenvale", "ashenvale": "ashenvale",
+    "борейская тундра": "borean-tundra", "борейская-тундра": "borean-tundra",
+    "borean tundra": "borean-tundra", "borean-tundra": "borean-tundra",
+    "галакронд": "galakrond", "galakrond": "galakrond",
+    "дракономор": "fordragon", "fordragon": "fordragon",
+    "подземье": "deepholm", "deepholm": "deepholm",
+    "разувий": "razuvious", "razuvious": "razuvious",
+    "ревущий фьорд": "howling-fjord", "ревущий-фьорд": "howling-fjord",
+    "howling fjord": "howling-fjord", "howling-fjord": "howling-fjord",
+    "седогрив": "greymane", "greymane": "greymane",
+    "ткач смерти": "deathweaver", "ткач-смерти": "deathweaver", "deathweaver": "deathweaver",
+    "silvermoon": "silvermoon", "силвермун": "silvermoon", "сильвермун": "silvermoon",
+    "twisting nether": "twisting-nether", "twisting-nether": "twisting-nether",
+    "твистинг незер": "twisting-nether", "твистинг-незер": "twisting-nether",
 }
 
 def normalize_realm(value: str) -> str:
-    raw = value.strip().lower()
-    return REALM_ALIASES.get(raw, raw.replace(" ", "-"))
+    raw = value.strip().lower().replace("_", "-")
+    raw = re.sub(r"[\s\-]+", " ", raw).strip()
+    if raw in REALM_ALIASES:
+        return REALM_ALIASES[raw]
+    slug = raw.replace(" ", "-")
+    return REALM_ALIASES.get(slug, slug)
 
 def class_data(class_name: str) -> dict:
     return CLASS_SPECS[class_name]
@@ -1376,30 +1400,35 @@ class RaidCreateView(discord.ui.View):
         super().__init__(timeout=180)
         self.add_item(RaidSelect())
 
-# Русскоязычные реалмы EU. В Discord показываем русское название,
-# а в Warcraft Logs передаём стабильный английский slug.
+# EU realms for signup. Discord Select allows max 25 options.
+# Show Russian name in UI; pass English WCL slug to the API.
+# "__other__" opens a modal where the player types any EU realm slug.
 RU_REALMS = [
     ("Азурегос", "azuregos"),
+    ("Борейская тундра", "borean-tundra"),
     ("Вечная Песня", "eversong"),
+    ("Галакронд", "galakrond"),
     ("Голдринн", "goldrinn"),
     ("Гордунни", "gordunni"),
     ("Гром", "grom"),
+    ("Дракономор", "fordragon"),
     ("Король-лич", "lich-king"),
     ("Пиратская бухта", "booty-bay"),
-    ("Свежеватель Душ", "soulflayer"),
-    ("Страж Смерти", "deathguard"),
-    ("Термоштепсель", "thermaplugg"),
-    ("Черный Шрам", "blackscar"),
-    ("Ясеневый лес", "ashenvale"),
-    ("Борейская тундра", "borean-tundra"),
-    ("Галакронд", "galakrond"),
-    ("Дракономор", "fordragon"),
     ("Подземье", "deepholm"),
     ("Разувий", "razuvious"),
     ("Ревущий фьорд", "howling-fjord"),
+    ("Свежеватель Душ", "soulflayer"),
     ("Седогрив", "greymane"),
+    ("Страж Смерти", "deathguard"),
+    ("Термоштепсель", "thermaplugg"),
     ("Ткач Смерти", "deathweaver"),
+    ("Черный Шрам", "blackscar"),
+    ("Ясеневый лес", "ashenvale"),
+    ("Silvermoon (EN)", "silvermoon"),
+    ("Twisting Nether (EN)", "twisting-nether"),
 ]
+# Sentinel: opens modal with free-text realm field.
+REALM_OTHER = "__other__"
 
 
 class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
@@ -1412,6 +1441,21 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
         self.spec_name = spec_name
         self.realm = realm
         self.replace_existing = replace_existing
+        # When realm is REALM_OTHER, player types any EU server slug/name.
+        self.realm_input = None
+        if realm == REALM_OTHER:
+            self.realm_input = discord.ui.TextInput(
+                label="Сервер (EU)",
+                placeholder="Например: kazzak, tarren-mill, howling-fjord",
+                max_length=40,
+                required=True,
+            )
+            self.add_item(self.realm_input)
+
+    def _resolved_realm(self) -> str:
+        if self.realm_input is not None:
+            return normalize_realm(str(self.realm_input.value))
+        return normalize_realm(self.realm)
 
     async def on_submit(self, interaction: discord.Interaction):
         raid = db.get_raid(self.channel_id)
@@ -1428,10 +1472,11 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         cd = CLASS_SPECS[self.class_name]
         wcl_spec = cd["specs"][self.spec_name]
+        realm_slug = self._resolved_realm()
         try:
             result = await wcl.character(
                 self.character_name.value.strip(),
-                self.realm,
+                realm_slug,
                 WCL_REGION,
                 raid["raid_id"],
                 raid["difficulty_id"],
@@ -1559,6 +1604,14 @@ class RealmSelect(discord.ui.Select):
             )
             for name, slug in RU_REALMS
         ]
+        options.append(
+            discord.SelectOption(
+                label="Другой сервер…",
+                value=REALM_OTHER,
+                description="Ввести название сервера вручную",
+                emoji="✏️",
+            )
+        )
         super().__init__(placeholder="Выберите сервер", options=options, custom_id="realm_select")
 
     async def callback(self, interaction: discord.Interaction):
