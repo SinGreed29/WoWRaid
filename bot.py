@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-24-realms-other-v16"
+CODE_VERSION = "2026-08-31-pending-approval-v17"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -222,7 +222,8 @@ SPEC_ROLE = {
 }
 
 STATUS_LABELS = {
-    "confirmed": ("Записан", "👥"),
+    "pending": ("В записи", "📝"),
+    "confirmed": ("В составе", "✅"),
     "late": ("Опоздаю", "🕐"),
     "cant": ("Не смогу", "❌"),
 }
@@ -535,6 +536,18 @@ class DB:
         raid_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(raids)").fetchall()}
         if "leader_name" not in raid_columns:
             self.conn.execute("ALTER TABLE raids ADD COLUMN leader_name TEXT")
+        # Last character used by a Discord user for quick re-signup.
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_prefs (
+            discord_id INTEGER PRIMARY KEY,
+            character_name TEXT NOT NULL,
+            realm TEXT NOT NULL,
+            region TEXT NOT NULL DEFAULT 'eu',
+            class_name TEXT NOT NULL,
+            spec_name TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """)
         self.conn.commit()
 
     def create_raid(self, data: dict):
@@ -665,6 +678,38 @@ class DB:
 
     def remove_player(self, channel_id: int, discord_id: int):
         self.conn.execute("DELETE FROM players WHERE channel_id=? AND discord_id=?", (channel_id, discord_id))
+        self.conn.commit()
+
+    def get_user_pref(self, discord_id: int):
+        return self.conn.execute(
+            "SELECT * FROM user_prefs WHERE discord_id=?", (discord_id,)
+        ).fetchone()
+
+    def set_user_pref(self, data: dict):
+        self.conn.execute("""
+        INSERT INTO user_prefs
+        (discord_id, character_name, realm, region, class_name, spec_name, updated_at)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(discord_id) DO UPDATE SET
+          character_name=excluded.character_name,
+          realm=excluded.realm,
+          region=excluded.region,
+          class_name=excluded.class_name,
+          spec_name=excluded.spec_name,
+          updated_at=excluded.updated_at
+        """, (
+            data["discord_id"], data["character_name"], data["realm"],
+            data.get("region", WCL_REGION), data["class_name"], data["spec_name"],
+            int(time.time()),
+        ))
+        self.conn.commit()
+
+    def accept_player(self, channel_id: int, discord_id: int, group_no: int):
+        self.conn.execute(
+            "UPDATE players SET status='confirmed', group_no=?, updated_at=? "
+            "WHERE channel_id=? AND discord_id=?",
+            (group_no, int(time.time()), channel_id, discord_id),
+        )
         self.conn.commit()
 
     def update_parses(self, channel_id: int, discord_id: int, result: dict):
@@ -1285,18 +1330,27 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
         inline=False,
     )
 
-    # Only the remaining status buttons are shown. The old "Не смогу"
-    # status is no longer exposed; cancellation removes the player entirely.
+    # Pending signups wait for leader approval; late stays separate.
     status_sections = []
-    for status, label, emoji in ((
-        ("unsure", "НЕ УВЕРЕН", "⚖️"),
+    pending = [p for p in players if p.get("status") == "pending"]
+    if pending:
+        lines = []
+        for p in pending:
+            icons = player_icons(guild, p)
+            char = p.get("character_name") or "?"
+            role = p.get("role") or "ДД"
+            lines.append(f"{icons} {char} · {role} · <@{p['discord_id']}>")
+        status_sections.append(
+            f"📝 **В записи ({len(pending)})**\n" + "\n".join(lines)
+        )
+    for status, label, emoji in (
         ("late", "ОПОЗДАЮ", "🕐"),
-    )):
+    ):
         users = [f"<@{p['discord_id']}>" for p in players if p.get("status") == status]
         if users:
             status_sections.append(f"{emoji} **{label} ({len(users)})**\n" + " ".join(users))
 
-    status_value = "\n\n".join(status_sections) if status_sections else "Нет заявленных статусов."
+    status_value = "\n\n".join(status_sections) if status_sections else "Нет заявок в очереди."
     if raid["raid_log"]:
         code = extract_report_code(raid["raid_log"])
         log_url = f"{WCL_SITE}/reports/{code}" if code else raid["raid_log"]
@@ -1328,6 +1382,85 @@ async def refresh_raid_message(channel: discord.abc.Messageable, channel_id: int
         embed=await build_raid_embed(raid, players),
         view=raid_view_with_log(raid["raid_log"]),
     )
+
+
+async def notify_leader_signup(
+    raid: sqlite3.Row,
+    user: discord.abc.User,
+    result: dict,
+    class_name: str,
+    spec_name: str,
+    wcl_spec: str,
+):
+    """DM raid leader about a new pending signup with Accept/Reject buttons."""
+    leader_id = int(raid["leader_id"]) if raid["leader_id"] else None
+    if not leader_id:
+        return
+    try:
+        leader = bot.get_user(leader_id) or await bot.fetch_user(leader_id)
+    except (discord.NotFound, discord.HTTPException):
+        return
+    if not leader:
+        return
+
+    cd = CLASS_SPECS.get(class_name, {})
+    p = result.get("avg_parse")
+    parse_line = f"**{p:.0f}**" if p is not None else "—"
+    role = role_for_spec(wcl_spec)
+    embed = discord.Embed(
+        title="📝 Новая заявка в рейд",
+        description=(
+            f"**Рейд:** {raid['name']}\n"
+            f"**Канал:** <#{raid['channel_id']}>\n"
+            f"**Игрок:** {user.mention} (`{user.display_name}`)\n"
+            f"**Персонаж:** **{result.get('character_name')}** · {result.get('server_slug', '?')}\n"
+            f"**Класс:** {cd.get('emoji', '')} {class_name} · {spec_name} ({role})\n"
+            f"**Средний лог:** {parse_line}"
+        ),
+        color=parse_color(percentile_number(p)),
+    )
+    if result.get("profile_url"):
+        embed.url = result["profile_url"]
+    view = LeaderDecisionView(int(raid["channel_id"]), int(user.id))
+    try:
+        await leader.send(embed=embed, view=view)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"[leader DM] cannot DM {leader_id}: {e}")
+
+
+async def notify_leader_cancel(
+    raid: sqlite3.Row,
+    user: discord.abc.User,
+    player_row,
+    reason: str,
+):
+    leader_id = int(raid["leader_id"]) if raid["leader_id"] else None
+    if not leader_id:
+        return
+    try:
+        leader = bot.get_user(leader_id) or await bot.fetch_user(leader_id)
+    except (discord.NotFound, discord.HTTPException):
+        return
+    if not leader:
+        return
+    char = player_row["character_name"] if player_row else "?"
+    status = player_row["status"] if player_row else "?"
+    reason_text = reason.strip() if reason and reason.strip() else "без указания причины"
+    embed = discord.Embed(
+        title="🚫 Отмена записи",
+        description=(
+            f"**Рейд:** {raid['name']}\n"
+            f"**Канал:** <#{raid['channel_id']}>\n"
+            f"**Игрок:** {user.mention}\n"
+            f"**Персонаж:** **{char}** (был статус: `{status}`)\n"
+            f"**Причина:** {reason_text}"
+        ),
+        color=0xE74C3C,
+    )
+    try:
+        await leader.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"[leader DM cancel] {leader_id}: {e}")
 
 class RaidSetupModal(discord.ui.Modal, title="Настройка рейда"):
     raid_name = discord.ui.TextInput(label="Название рейда", placeholder="Алорика", max_length=60)
@@ -1495,12 +1628,8 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
             )
             return
 
-        group_no = int(old["group_no"] or 1) if old else 1
-        if not old:
-            for candidate in range(1, 7):
-                if len(db.get_group_players(self.channel_id, candidate)) < 5:
-                    group_no = candidate
-                    break
+        # Pending until raid leader accepts into a group.
+        group_no = int(old["group_no"] or 1) if old and old["status"] == "confirmed" else 1
 
         db.upsert_player({
             "channel_id": self.channel_id,
@@ -1514,25 +1643,32 @@ class CharacterModal(discord.ui.Modal, title="Запись в рейд"):
             "spec_name": self.spec_name,
             "wcl_spec": wcl_spec,
             "role": role_for_spec(wcl_spec),
-            "status": "confirmed",
+            "status": "pending",
             "avg_parse": result.get("avg_parse"),
             "best_parse": result.get("best_parse"),
             "bosses": result.get("bosses", []),
             "profile_url": result.get("profile_url"),
             "group_no": group_no,
         })
+        db.set_user_pref({
+            "discord_id": interaction.user.id,
+            "character_name": result["character_name"],
+            "realm": result["server_slug"],
+            "region": WCL_REGION,
+            "class_name": self.class_name,
+            "spec_name": self.spec_name,
+        })
         channel = interaction.channel
         await refresh_raid_message(channel, self.channel_id)
+        await notify_leader_signup(raid, interaction.user, result, self.class_name, self.spec_name, wcl_spec)
 
         p = result.get("avg_parse")
-        action = "обновлён" if old else "записан"
+        parse_line = f"📈 Средний лог: **{p:.0f}**" if p is not None else "📈 Лог: `—`"
         text = (
-            f"✅ **{result['character_name']}** {action}.\n"
+            f"📝 **{result['character_name']}** — заявка отправлена.\n"
             f"{cd['emoji']} {self.class_name} · {self.spec_name}\n"
-            f"📈 Средний лог: **{p:.0f}**" if p is not None else
-            f"✅ **{result['character_name']}** {action}.\n"
-            f"{cd['emoji']} {self.class_name} · {self.spec_name}\n"
-            f"📈 Лог: `—`"
+            f"{parse_line}\n"
+            f"Ожидайте решения рейд-лидера. Пока вы в списке **«В записи»**."
         )
         await interaction.followup.send(text, ephemeral=True)
 
@@ -1677,6 +1813,289 @@ class SpecSelectView(discord.ui.View):
         super().__init__(timeout=180)
         self.add_item(SpecSelect(channel_id, class_name, guild_id, replace_existing))
 
+class LeaderGroupSelect(discord.ui.Select):
+    def __init__(self, channel_id: int, player_id: int):
+        self.channel_id = channel_id
+        self.player_id = player_id
+        options = []
+        for i in range(1, 7):
+            n = len(db.get_group_players(channel_id, i))
+            options.append(
+                discord.SelectOption(
+                    label=f"Группа {i}",
+                    value=str(i),
+                    description=f"{n}/5 игроков",
+                    emoji="👥",
+                )
+            )
+        super().__init__(placeholder="Выберите группу для игрока", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        raid = db.get_raid(self.channel_id)
+        if not raid:
+            await interaction.response.edit_message(content="❌ Рейд уже удалён.", embed=None, view=None)
+            return
+        if int(raid["leader_id"]) != interaction.user.id and not (
+            interaction.guild and interaction.user.guild_permissions.manage_guild
+        ):
+            # DM context: only the leader who received the message should act.
+            if int(raid["leader_id"]) != interaction.user.id:
+                await interaction.response.send_message("❌ Только рейд-лидер.", ephemeral=True)
+                return
+        player = db.get_player(self.channel_id, self.player_id)
+        if not player:
+            await interaction.response.edit_message(
+                content="❌ Игрок уже не в списке (отменил запись или отклонён).",
+                embed=None,
+                view=None,
+            )
+            return
+        group_no = int(self.values[0])
+        if len(db.get_group_players(self.channel_id, group_no)) >= 5:
+            await interaction.response.send_message(
+                f"❌ Группа {group_no} уже заполнена (5/5). Выберите другую.",
+                ephemeral=True,
+            )
+            return
+        confirmed = sum(1 for r in db.get_players(self.channel_id) if r["status"] == "confirmed")
+        if confirmed >= RAID_LIMIT and player["status"] != "confirmed":
+            await interaction.response.send_message("❌ Состав уже полный (30/30).", ephemeral=True)
+            return
+        db.accept_player(self.channel_id, self.player_id, group_no)
+        channel = bot.get_channel(self.channel_id)
+        if channel:
+            try:
+                await refresh_raid_message(channel, self.channel_id)
+            except Exception as e:
+                print(f"[accept refresh] {e}")
+        # Notify the player
+        try:
+            member = bot.get_user(self.player_id) or await bot.fetch_user(self.player_id)
+            if member:
+                await member.send(
+                    f"✅ Вас приняли в рейд **{raid['name']}** "
+                    f"(канал <#{self.channel_id}>), группа **{group_no}**.\n"
+                    f"Персонаж: **{player['character_name']}**."
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **{player['character_name']}** (<@{self.player_id}>) принят в "
+                f"**Группу {group_no}** рейда **{raid['name']}**."
+            ),
+            embed=None,
+            view=None,
+        )
+
+
+class LeaderGroupView(discord.ui.View):
+    def __init__(self, channel_id: int, player_id: int):
+        super().__init__(timeout=600)
+        self.add_item(LeaderGroupSelect(channel_id, player_id))
+
+
+class LeaderApproveButton(discord.ui.Button):
+    def __init__(self, channel_id: int, player_id: int):
+        super().__init__(
+            label="Принять в состав",
+            style=discord.ButtonStyle.success,
+            emoji="✅",
+            custom_id=f"raid_approve:{channel_id}:{player_id}",
+        )
+        self.channel_id = channel_id
+        self.player_id = player_id
+
+    async def callback(self, interaction: discord.Interaction):
+        raid = db.get_raid(self.channel_id)
+        if not raid:
+            await interaction.response.edit_message(content="❌ Рейд удалён.", embed=None, view=None)
+            return
+        if int(raid["leader_id"]) != interaction.user.id:
+            await interaction.response.send_message("❌ Только рейд-лидер этого рейда.", ephemeral=True)
+            return
+        player = db.get_player(self.channel_id, self.player_id)
+        if not player:
+            await interaction.response.edit_message(
+                content="❌ Игрок уже не в списке.", embed=None, view=None
+            )
+            return
+        if player["status"] == "confirmed":
+            await interaction.response.edit_message(
+                content=f"ℹ️ **{player['character_name']}** уже в составе.", embed=None, view=None
+            )
+            return
+        await interaction.response.edit_message(
+            content=(
+                f"Выберите группу для **{player['character_name']}** "
+                f"(<@{self.player_id}>):"
+            ),
+            embed=None,
+            view=LeaderGroupView(self.channel_id, self.player_id),
+        )
+
+
+class LeaderRejectButton(discord.ui.Button):
+    def __init__(self, channel_id: int, player_id: int):
+        super().__init__(
+            label="Не принять",
+            style=discord.ButtonStyle.danger,
+            emoji="❌",
+            custom_id=f"raid_reject:{channel_id}:{player_id}",
+        )
+        self.channel_id = channel_id
+        self.player_id = player_id
+
+    async def callback(self, interaction: discord.Interaction):
+        raid = db.get_raid(self.channel_id)
+        if not raid:
+            await interaction.response.edit_message(content="❌ Рейд удалён.", embed=None, view=None)
+            return
+        if int(raid["leader_id"]) != interaction.user.id:
+            await interaction.response.send_message("❌ Только рейд-лидер этого рейда.", ephemeral=True)
+            return
+        player = db.get_player(self.channel_id, self.player_id)
+        if not player:
+            await interaction.response.edit_message(
+                content="❌ Игрок уже не в списке.", embed=None, view=None
+            )
+            return
+        char = player["character_name"]
+        db.remove_player(self.channel_id, self.player_id)
+        channel = bot.get_channel(self.channel_id)
+        if channel:
+            try:
+                await refresh_raid_message(channel, self.channel_id)
+            except Exception as e:
+                print(f"[reject refresh] {e}")
+        try:
+            member = bot.get_user(self.player_id) or await bot.fetch_user(self.player_id)
+            if member:
+                await member.send(
+                    f"❌ Заявка на рейд **{raid['name']}** (канал <#{self.channel_id}>) "
+                    f"для **{char}** отклонена рейд-лидером."
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await interaction.response.edit_message(
+            content=f"❌ **{char}** (<@{self.player_id}>) — заявка отклонена.",
+            embed=None,
+            view=None,
+        )
+
+
+class LeaderDecisionView(discord.ui.View):
+    def __init__(self, channel_id: int, player_id: int):
+        super().__init__(timeout=None)
+        self.add_item(LeaderApproveButton(channel_id, player_id))
+        self.add_item(LeaderRejectButton(channel_id, player_id))
+
+
+class QuickSignupButton(discord.ui.Button):
+    """Re-submit the last remembered character into the current raid as pending."""
+
+    def __init__(self, channel_id: int):
+        super().__init__(label="Быстрая запись", style=discord.ButtonStyle.success, emoji="⚡")
+        self.channel_id = channel_id
+
+    async def callback(self, interaction: discord.Interaction):
+        raid = db.get_raid(self.channel_id)
+        if not raid or raid["closed"]:
+            await interaction.response.send_message("❌ Рейд закрыт.", ephemeral=True)
+            return
+        pref = db.get_user_pref(interaction.user.id)
+        if not pref:
+            await interaction.response.send_message(
+                "Нет сохранённого персонажа. Выберите класс вручную.",
+                view=ClassSelectView(self.channel_id, interaction.guild_id),
+                ephemeral=True,
+            )
+            return
+        confirmed = sum(1 for r in db.get_players(self.channel_id) if r["status"] == "confirmed")
+        existing = db.get_player(self.channel_id, interaction.user.id)
+        if confirmed >= RAID_LIMIT and not (existing and existing["status"] == "confirmed"):
+            await interaction.response.send_message("❌ Рейд заполнен.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        cd = CLASS_SPECS[pref["class_name"]]
+        wcl_spec = cd["specs"][pref["spec_name"]]
+        try:
+            result = await wcl.character(
+                pref["character_name"], pref["realm"], pref["region"] or WCL_REGION,
+                raid["raid_id"], raid["difficulty_id"], cd["wcl"], wcl_spec,
+            )
+        except Exception as e:
+            await interaction.followup.send(f"❌ WCL: `{str(e)[:800]}`", ephemeral=True)
+            return
+        if not result.get("found"):
+            await interaction.followup.send(
+                f"❌ {result.get('error', 'Персонаж не найден.')}\nВыберите данные заново.",
+                view=ClassSelectView(self.channel_id, interaction.guild_id, replace_existing=True),
+                ephemeral=True,
+            )
+            return
+        db.upsert_player({
+            "channel_id": self.channel_id,
+            "discord_id": interaction.user.id,
+            "discord_name": interaction.user.display_name,
+            "character_name": result["character_name"],
+            "realm": result["server_slug"],
+            "region": WCL_REGION,
+            "class_name": pref["class_name"],
+            "wcl_class": cd["wcl"],
+            "spec_name": pref["spec_name"],
+            "wcl_spec": wcl_spec,
+            "role": role_for_spec(wcl_spec),
+            "status": "pending",
+            "avg_parse": result.get("avg_parse"),
+            "best_parse": result.get("best_parse"),
+            "bosses": result.get("bosses", []),
+            "profile_url": result.get("profile_url"),
+            "group_no": 1,
+        })
+        db.set_user_pref({
+            "discord_id": interaction.user.id,
+            "character_name": result["character_name"],
+            "realm": result["server_slug"],
+            "region": WCL_REGION,
+            "class_name": pref["class_name"],
+            "spec_name": pref["spec_name"],
+        })
+        await refresh_raid_message(interaction.channel, self.channel_id)
+        await notify_leader_signup(
+            raid, interaction.user, result, pref["class_name"], pref["spec_name"], wcl_spec
+        )
+        p = result.get("avg_parse")
+        parse_line = f"**{p:.0f}**" if p is not None else "—"
+        await interaction.followup.send(
+            f"📝 **{result['character_name']}** — заявка отправлена (быстрая запись).\n"
+            f"{cd['emoji']} {pref['class_name']} · {pref['spec_name']} · лог {parse_line}\n"
+            f"Ожидайте решения рейд-лидера.",
+            ephemeral=True,
+        )
+
+
+class OtherCharacterButton(discord.ui.Button):
+    def __init__(self, channel_id: int, replace_existing: bool = False):
+        super().__init__(label="Другой персонаж", style=discord.ButtonStyle.secondary, emoji="✏️")
+        self.channel_id = channel_id
+        self.replace_existing = replace_existing
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Выберите класс:",
+            view=ClassSelectView(self.channel_id, interaction.guild_id, self.replace_existing),
+            ephemeral=True,
+        )
+
+
+class QuickSignupView(discord.ui.View):
+    def __init__(self, channel_id: int, replace_existing: bool = False):
+        super().__init__(timeout=180)
+        self.add_item(QuickSignupButton(channel_id))
+        self.add_item(OtherCharacterButton(channel_id, replace_existing))
+
+
 class JoinButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="Запись", style=discord.ButtonStyle.primary, emoji="👥", custom_id="raid_join")
@@ -1690,6 +2109,21 @@ class JoinButton(discord.ui.Button):
         confirmed = sum(1 for r in db.get_players(interaction.channel_id) if r["status"] == "confirmed")
         if confirmed >= RAID_LIMIT and not (existing and existing["status"] == "confirmed"):
             await interaction.response.send_message("❌ Рейд заполнен.", ephemeral=True)
+            return
+        pref = db.get_user_pref(interaction.user.id)
+        if pref:
+            msg = (
+                f"Последний персонаж: **{pref['character_name']}** · "
+                f"{pref['class_name']} / {pref['spec_name']} · `{pref['realm']}`\n"
+                f"Использовать его или выбрать другого?"
+            )
+            if existing:
+                msg = "Вы уже в списке этого рейда. " + msg
+            await interaction.response.send_message(
+                msg,
+                view=QuickSignupView(interaction.channel_id, replace_existing=bool(existing)),
+                ephemeral=True,
+            )
             return
         if existing:
             await interaction.response.send_message(
@@ -1727,6 +2161,35 @@ class StatusButton(discord.ui.Button):
             ephemeral=True
         )
 
+class CancelReasonModal(discord.ui.Modal, title="Отмена записи"):
+    reason = discord.ui.TextInput(
+        label="Причина (необязательно)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Можно оставить пустым и просто нажать Отправить",
+        required=False,
+        max_length=300,
+    )
+
+    def __init__(self, channel_id: int):
+        super().__init__()
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raid = db.get_raid(self.channel_id)
+        if not raid:
+            await interaction.response.send_message("❌ Рейд не найден.", ephemeral=True)
+            return
+        player = db.get_player(self.channel_id, interaction.user.id)
+        if not player:
+            await interaction.response.send_message("Вы уже не в списке этого рейда.", ephemeral=True)
+            return
+        reason = str(self.reason.value or "")
+        await notify_leader_cancel(raid, interaction.user, player, reason)
+        db.remove_player(self.channel_id, interaction.user.id)
+        await refresh_raid_message(interaction.channel, self.channel_id)
+        await interaction.response.send_message("✅ Ваша запись отменена.", ephemeral=True)
+
+
 class CancelButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
@@ -1747,9 +2210,7 @@ class CancelButton(discord.ui.Button):
             await interaction.response.send_message("Вы не записаны в этот рейд.", ephemeral=True)
             return
 
-        db.remove_player(interaction.channel_id, interaction.user.id)
-        await refresh_raid_message(interaction.channel, interaction.channel_id)
-        await interaction.response.send_message("✅ Ваша запись отменена.", ephemeral=True)
+        await interaction.response.send_modal(CancelReasonModal(interaction.channel_id))
 
 
 class GroupSourceSelect(discord.ui.Select):
