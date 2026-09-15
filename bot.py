@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-08-31-pending-approval-v17"
+CODE_VERSION = "2026-09-15-parse-digits-v19"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -235,7 +235,23 @@ ROLE_EMOJI = {"Танк": "🛡️", "Хил": "💚", "ДД": "⚔️"}
 #   class_warrior, class_paladin, class_hunter, ...
 #   spec_arms, spec_fury, spec_protection, ...
 # The bot automatically finds them by name. IDs do NOT need to be hardcoded.
+#
+# Colored parse digits (50 emojis, preferably animated GIF slots):
+#   parse_gray_0..9   →  0–24
+#   parse_green_0..9  → 25–49
+#   parse_blue_0..9   → 50–74
+#   parse_purple_0..9 → 75–94
+#   parse_orange_0..9 → 95–100
+# If a digit emoji is missing, falls back to Unicode square + bold number.
 RAID_IMAGES: dict[str, str] = {}
+
+PARSE_DIGIT_TIERS = (
+    (95, "parse_orange"),
+    (75, "parse_purple"),
+    (50, "parse_blue"),
+    (25, "parse_green"),
+    (0, "parse_gray"),
+)
 
 CLASS_EMOJI_NAMES = {
     "Warrior": "class_warrior",
@@ -447,10 +463,9 @@ def parse_color(p: Optional[float]) -> int:
     return 0x666666
 
 def parse_emoji(p: Optional[float]) -> str:
+    """Unicode fallback when custom digit emojis are not on the server."""
     if p is None:
         return "▫️"
-    if p >= 99:
-        return "🟣"
     if p >= 95:
         return "🟠"
     if p >= 75:
@@ -460,6 +475,32 @@ def parse_emoji(p: Optional[float]) -> str:
     if p >= 25:
         return "🟩"
     return "⬜"
+
+
+def parse_digit_tier(p: float) -> str:
+    for threshold, prefix in PARSE_DIGIT_TIERS:
+        if p >= threshold:
+            return prefix
+    return "parse_gray"
+
+
+def format_parse_number(guild: Optional[discord.Guild], p: Optional[float]) -> str:
+    """
+    Render a parse as colored digit emojis: parse_{gray|green|blue|purple|orange}_{0-9}.
+    Falls back to Unicode square + bold number if any required digit is missing.
+    """
+    if p is None:
+        return f"{parse_emoji(None)} **—**"
+    n = int(round(p))
+    n = max(0, min(100, n))
+    prefix = parse_digit_tier(float(n))
+    parts = []
+    for ch in str(n):
+        emoji = get_custom_emoji(guild, f"{prefix}_{ch}")
+        if not emoji:
+            return f"{parse_emoji(float(n))} **{n}**"
+        parts.append(emoji)
+    return "".join(parts)
 
 
 def get_custom_emoji_by_name(guild: Optional[discord.Guild], name: str, fallback: str = "") -> str:
@@ -1222,7 +1263,7 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
         color=parse_color(avg),
     )
 
-    avg_text = f"{parse_emoji(avg)} **{avg:.0f}**" if avg is not None else "—"
+    avg_text = format_parse_number(guild, avg)
     embed.description = (
         f"`{raid['difficulty_name']}` · **{raid['date_text']}**\n"
         f"**Средний лог рейда:** {avg_text}\n"
@@ -1248,8 +1289,7 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
             vals = boss_values[boss_name]
             boss_avg = sum(vals) / len(vals) if vals else None
             boss_lines.append(
-                f"{parse_emoji(boss_avg)} **{boss_avg:.0f}** {boss_name}"
-                if boss_avg is not None else f"⬜ **—** {boss_name}"
+                f"{format_parse_number(guild, boss_avg)} {boss_name}"
             )
         # Keep the field readable even for long raid names.
         embed.add_field(name="Опыт рейда", value="\n".join(boss_lines), inline=False)
@@ -1305,12 +1345,12 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
         lines = []
         for p in group:
             pval = percentile_number(p.get("avg_parse"))
-            parse_text = f"{pval:.0f}" if pval is not None else "—"
+            parse_text = format_parse_number(guild, pval)
             icons = player_icons(guild, p)
             name = str(p.get("character_name") or "Неизвестный")
             if p.get("profile_url"):
                 name = f"[{name}]({p['profile_url']})"
-            lines.append(f"{icons} **{parse_text}** {name}")
+            lines.append(f"{icons} {parse_text} {name}")
         group_fields[group_no] = (f"Группа {group_no}", "\n".join(lines) or "—")
 
     for left in (1, 3, 5):
@@ -2550,19 +2590,27 @@ async def parse_cmd(
     except Exception as e:
         await interaction.edit_original_response(content=f"❌ WCL: {str(e)[:1500]}")
 
-@bot.tree.command(name="emoji_status", description="Проверить WoW-эмодзи классов и специализаций")
+@bot.tree.command(name="emoji_status", description="Проверить WoW-эмодзи классов, спеков и цифр парсов")
 async def emoji_status(interaction: discord.Interaction):
     missing_classes = []
     missing_specs = []
+    missing_digits = []
 
     for data in CLASS_SPECS.values():
         emoji_name = CLASS_EMOJI_NAMES.get(data["wcl"])
         if emoji_name and not discord.utils.get(interaction.guild.emojis, name=emoji_name):
             missing_classes.append(emoji_name)
-        for spec, _wcl_spec in data["specs"].items():
-            emoji_name = SPEC_EMOJI_NAMES.get(spec)
+        for _spec, wcl_spec in data["specs"].items():
+            emoji_name = SPEC_EMOJI_NAMES.get(wcl_spec)
             if emoji_name and not discord.utils.get(interaction.guild.emojis, name=emoji_name):
-                missing_specs.append(emoji_name)
+                if emoji_name not in missing_specs:
+                    missing_specs.append(emoji_name)
+
+    for _threshold, prefix in PARSE_DIGIT_TIERS:
+        for d in range(10):
+            name = f"{prefix}_{d}"
+            if not discord.utils.get(interaction.guild.emojis, name=name):
+                missing_digits.append(name)
 
     lines = [
         "### Эмодзи классов",
@@ -2570,6 +2618,9 @@ async def emoji_status(interaction: discord.Interaction):
         "",
         "### Эмодзи специализаций",
         "✅ Все загружены." if not missing_specs else "❌ Не хватает: " + ", ".join(missing_specs),
+        "",
+        "### Цифры парсов (50 шт.)",
+        "✅ Все загружены." if not missing_digits else f"❌ Не хватает ({len(missing_digits)}): " + ", ".join(missing_digits[:30]) + ("…" if len(missing_digits) > 30 else ""),
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
