@@ -17,7 +17,7 @@ from discord.ext import commands, tasks
 from pathlib import Path
 from dotenv import load_dotenv
 
-CODE_VERSION = "2026-09-15-parse-digits-v19"
+CODE_VERSION = "2026-09-16-role-icons-v21"
 
 # Local development: if .env exists next to bot.py, load it.
 # On Railway/.other hosts secrets are provided as environment variables, so
@@ -228,7 +228,19 @@ STATUS_LABELS = {
     "cant": ("Не смогу", "❌"),
 }
 
-ROLE_EMOJI = {"Танк": "🛡️", "Хил": "💚", "ДД": "⚔️"}
+# Unicode fallbacks. Prefer custom server emojis (classic WoW-style):
+#   role_tank, role_heal, role_dps
+ROLE_EMOJI_FALLBACK = {"Танк": "🛡️", "Хил": "💚", "ДД": "⚔️"}
+ROLE_EMOJI_NAMES = {"Танк": "role_tank", "Хил": "role_heal", "ДД": "role_dps"}
+
+def role_emoji(guild, role):
+    """Classic WoW role icon from the server, with Unicode fallback."""
+    name = ROLE_EMOJI_NAMES.get(role)
+    if name:
+        custom = get_custom_emoji(guild, name)
+        if custom:
+            return custom
+    return ROLE_EMOJI_FALLBACK.get(role, "⚔️")
 
 # Custom Discord emoji convention.
 # Upload WoW icons to the server with these names:
@@ -313,13 +325,53 @@ SPEC_EMOJI_NAMES = {
 
 def get_custom_emoji_obj(guild: Optional[discord.Guild], emoji_name: Optional[str]):
     """Return a guild emoji object for Discord SelectOption, if available."""
-    if guild and emoji_name:
-        return discord.utils.get(guild.emojis, name=emoji_name)
+    if not guild or not emoji_name:
+        return None
+    emoji = discord.utils.get(guild.emojis, name=emoji_name)
+    if emoji:
+        return emoji
+    # Case-insensitive fallback (Discord names are usually exact, but uploads differ).
+    name_l = emoji_name.lower()
+    for e in guild.emojis:
+        if e.name.lower() == name_l:
+            return e
     return None
+
+
+def emoji_markup(emoji: discord.Emoji) -> str:
+    """Explicit static/animated markup so embeds always render server emojis."""
+    if emoji.animated:
+        return f"<a:{emoji.name}:{emoji.id}>"
+    return f"<:{emoji.name}:{emoji.id}>"
+
 
 def get_custom_emoji(guild: Optional[discord.Guild], emoji_name: Optional[str]) -> str:
     emoji = get_custom_emoji_obj(guild, emoji_name)
-    return str(emoji) if emoji else ""
+    return emoji_markup(emoji) if emoji else ""
+
+
+async def resolve_guild_for_raid(raid: sqlite3.Row, channel: Optional[discord.abc.Messageable] = None) -> Optional[discord.Guild]:
+    """Get guild for emoji lookup; refresh emoji cache if parse digits are missing."""
+    guild = None
+    if raid["guild_id"]:
+        guild = bot.get_guild(int(raid["guild_id"]))
+    if guild is None and channel is not None:
+        guild = getattr(channel, "guild", None)
+    if guild is None:
+        print(f"[emoji] guild not found for raid channel={raid['channel_id']} guild_id={raid['guild_id']}")
+        return None
+    # If digit emojis were uploaded after bot start, cache may be stale — fetch once.
+    probe = get_custom_emoji_obj(guild, "parse_blue_5") or get_custom_emoji_obj(guild, "parse_purple_8")
+    if probe is None:
+        try:
+            fetched = await guild.fetch_emojis()
+            print(f"[emoji] fetched {len(fetched)} emojis for guild {guild.id}")
+            # Count parse digits for diagnostics
+            n_parse = sum(1 for e in fetched if e.name.startswith("parse_"))
+            print(f"[emoji] parse_* emojis visible: {n_parse}")
+        except Exception as e:
+            print(f"[emoji] fetch_emojis failed: {e}")
+    return guild
 
 def player_icons(guild: Optional[discord.Guild], player: dict) -> str:
     """Class + specialization icons only. Role icons are intentionally omitted next to names."""
@@ -487,6 +539,7 @@ def parse_digit_tier(p: float) -> str:
 def format_parse_number(guild: Optional[discord.Guild], p: Optional[float]) -> str:
     """
     Render a parse as colored digit emojis: parse_{gray|green|blue|purple|orange}_{0-9}.
+    Works with both static and animated server emojis (bots do not need Nitro).
     Falls back to Unicode square + bold number if any required digit is missing.
     """
     if p is None:
@@ -496,8 +549,14 @@ def format_parse_number(guild: Optional[discord.Guild], p: Optional[float]) -> s
     prefix = parse_digit_tier(float(n))
     parts = []
     for ch in str(n):
-        emoji = get_custom_emoji(guild, f"{prefix}_{ch}")
+        name = f"{prefix}_{ch}"
+        emoji = get_custom_emoji(guild, name)
         if not emoji:
+            # One-line diagnostic so Railway logs show the real miss.
+            available = []
+            if guild:
+                available = [e.name for e in guild.emojis if e.name.startswith(prefix)]
+            print(f"[parse digits] missing {name}; guild={getattr(guild, 'id', None)}; have={available[:12]}")
             return f"{parse_emoji(float(n))} **{n}**"
         parts.append(emoji)
     return "".join(parts)
@@ -1237,10 +1296,14 @@ def make_player_dict(row: sqlite3.Row) -> dict:
         d["bosses"] = []
     return d
 
-async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Embed:
+async def build_raid_embed(
+    raid: sqlite3.Row,
+    players: list[dict],
+    channel: Optional[discord.abc.Messageable] = None,
+) -> discord.Embed:
     """Build a compact public raid card close to the requested reference layout."""
     info = RAIDS[raid["raid_id"]]
-    guild = bot.get_guild(int(raid["guild_id"])) if raid["guild_id"] else None
+    guild = await resolve_guild_for_raid(raid, channel)
     try:
         db.rebalance_groups_if_needed(raid["channel_id"])
         players = [make_player_dict(r) for r in db.get_players(raid["channel_id"])]
@@ -1327,9 +1390,9 @@ async def build_raid_embed(raid: sqlite3.Row, players: list[dict]) -> discord.Em
     embed.add_field(
         name=f"Утвержденный состав ({len(confirmed)}/{RAID_LIMIT})",
         value=(
-            f"{ROLE_EMOJI['Танк']} **{roles['Танк']}**  "
-            f"{ROLE_EMOJI['Хил']} **{roles['Хил']}**  "
-            f"{ROLE_EMOJI['ДД']} **{roles['ДД']}**"
+            f"{role_emoji(guild, 'Танк')} **{roles['Танк']}**  "
+            f"{role_emoji(guild, 'Хил')} **{roles['Хил']}**  "
+            f"{role_emoji(guild, 'ДД')} **{roles['ДД']}**"
         ),
         inline=False,
     )
@@ -1419,7 +1482,7 @@ async def refresh_raid_message(channel: discord.abc.Messageable, channel_id: int
     except Exception:
         return
     await msg.edit(
-        embed=await build_raid_embed(raid, players),
+        embed=await build_raid_embed(raid, players, channel=channel),
         view=raid_view_with_log(raid["raid_log"]),
     )
 
